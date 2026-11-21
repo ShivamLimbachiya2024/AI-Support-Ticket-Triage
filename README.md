@@ -8,7 +8,7 @@ Express, PostgreSQL/pgvector, RabbitMQ, and Gemini support ticket triage. The AP
 2. Run `docker compose up -d --build`.
 3. The API runs on PORT. Compose starts one processing worker and one retry worker. The support account is seeded from SUPPORT_EMAIL and SUPPORT_PASSWORD.
 
-For a no-key run, set `MODEL_PROVIDER=fake`, `MODEL_NAME=fake_v1`, and `EMBEDDING_MODEL=fake_embedding_v1`. For a real Gemini run, set `MODEL_PROVIDER=gemini`, `MODEL_NAME=gemini-4-carbon`, `EMBEDDING_MODEL=gemini-embedding-2`, and `GEMINI_API_KEY`. `GEMINI_API_KEY` is required only in Gemini mode. When running the app outside Compose, set the host in `DATABASE_URL` to the address where PostgreSQL is reachable, such as `localhost`.
+For a no-key run, set `MODEL_PROVIDER=fake`, `MODEL_NAME=fake_v1`, and `EMBEDDING_MODEL=fake_embedding_v1`. For a lower-cost real Gemini run, set `MODEL_PROVIDER=gemini`, `MODEL_NAME=gemini-3.5-flash-lite`, `EMBEDDING_MODEL=gemini-embedding-2`, and `GEMINI_API_KEY`. `GEMINI_API_KEY` is required only in Gemini mode. Confirm the model has a nonzero quota for your project in Google AI Studio. When running the app outside Compose, set the host in `DATABASE_URL` to the address where PostgreSQL is reachable, such as `localhost`.
 
 Run npm test and npm run build. Migrations use Sequelize CLI and the pgvector extension is bootstrapped by the PostgreSQL image. The pgvector image builds FROM the existing postgres:16 image; Compose uses the existing rabbitmq:4.3.7-management image.
 
