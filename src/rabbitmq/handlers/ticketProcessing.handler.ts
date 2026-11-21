@@ -134,17 +134,18 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
       });
       logger.info(`Ticket ${ticketId} triage result persistence completed`);
 
-      logger.info(
-        `Ticket ${ticketId} status transition started: ${TRIAGE_STATUS.PROCESSING} to ${TRIAGE_STATUS.TRIAGED}`
-      );
       const confident = (triageResult.result.confidence ?? 0) >= 0.85;
-      currentTicket.triage_status = confident ? TRIAGE_STATUS.TRIAGED : TRIAGE_STATUS.MANUAL_REVIEW;
+      const newStatus = confident ? TRIAGE_STATUS.TRIAGED : TRIAGE_STATUS.MANUAL_REVIEW;
+      logger.info(
+        `Ticket ${ticketId} status transition started: ${TRIAGE_STATUS.PROCESSING} to ${newStatus}`
+      );
+      currentTicket.triage_status = newStatus;
       currentTicket.status_reason = confident
         ? TICKET_STATUS_REASON.TRIAGE_COMPLETED
         : 'Low classification confidence';
       currentTicket.completed_at = new Date();
       await currentTicket.save({ transaction });
-      logger.info(`Ticket ${ticketId} status updated to ${TRIAGE_STATUS.TRIAGED}`);
+      logger.info(`Ticket ${ticketId} status updated to ${currentTicket.triage_status}`);
 
       logger.info(`Ticket ${ticketId} triage-completed history write started`);
       await TicketStatusHistory.create(
