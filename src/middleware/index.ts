@@ -7,16 +7,21 @@ import User from '../sequelize/models/users.modal';
 export interface AuthRequest extends Request {
   userId?: number;
   role?: string;
+  userEmail?: string;
   validatedQuery?: unknown;
 }
 export const validate =
-  (schema: Joi.ObjectSchema) => (req: Request, res: Response, next: NextFunction) => {
-    const { error, value } = schema.validate(req.body, { abortEarly: false, stripUnknown: true });
+  (schema: Joi.ObjectSchema, source: 'body' | 'params' = 'body') =>
+  (req: Request, res: Response, next: NextFunction) => {
+    const input = source === 'body' ? req.body : req.params;
+    const { error, value } = schema.validate(input, { abortEarly: false, stripUnknown: true });
     if (error) {
       res.status(400).json({ message: error.message });
       return;
     }
-    req.body = value;
+
+    if (source === 'body') req.body = value;
+    if (source === 'params') req.params = value;
     next();
   };
 
@@ -57,6 +62,7 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
   }
   req.userId = Number(user.id);
   req.role = user.role;
+  req.userEmail = user.email;
   next();
 };
 export const requestLog = (req: Request, res: Response, next: NextFunction) => {

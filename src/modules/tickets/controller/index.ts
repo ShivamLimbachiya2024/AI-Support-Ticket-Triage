@@ -10,11 +10,24 @@ import { QueueAction, QueueName, sendToQueue } from '../../../rabbitmq';
 import type { ListTicketsQuery } from '../validation-schema';
 
 export const submitTicket = async (req: AuthRequest, res: Response) => {
+  const { subject, body, customer_email: submittedEmail } = req.body;
+  const customerEmail = req.role === USER_ROLE.SUPPORT ? submittedEmail : req.userEmail;
+
+  if (
+    req.role !== USER_ROLE.SUPPORT &&
+    submittedEmail.toLowerCase() !== customerEmail?.toLowerCase()
+  ) {
+    res.status(400).json({ message: 'Ticket email must match the authenticated account' });
+    return;
+  }
+
   const ticket = await db.transaction(async (transaction) => {
     const created = await Ticket.create(
       {
         customer_id: req.userId,
-        ...req.body,
+        subject,
+        body,
+        customer_email: customerEmail,
         triage_status: TRIAGE_STATUS.PENDING,
         retry_count: 0,
         processing_attempt: 0,

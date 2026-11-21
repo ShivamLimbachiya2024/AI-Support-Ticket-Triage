@@ -16,7 +16,7 @@ Run npm test and npm run build. Migrations use Sequelize CLI and the pgvector ex
 
 - POST /api/auth/register: first_name, last_name, email, optional phone, password. New accounts are customers.
 - POST /api/auth/login: email, password. Returns an HTTP-only cookie.
-- POST /api/tickets: subject, body, customer_email. Returns 202 with ticket ID and triage_status.
+- POST /api/tickets: subject, body, customer_email. Customer submissions must use the authenticated account email; support users may submit a ticket for another email. Returns 202 with ticket ID and triage_status.
 - GET /api/tickets/:id: customers see only their own status; support sees the ticket and validated triage result.
 - GET /api/tickets?status=&category=&priority=&page=1&limit=20: support only.
 
