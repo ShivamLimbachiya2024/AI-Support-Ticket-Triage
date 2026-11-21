@@ -61,20 +61,6 @@ services:
     depends_on:
       api: { condition: service_started }
     command: ['node', 'dist/app.js']
-  retry_worker:
-    restart: unless-stopped
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.app
-    env_file: .env
-    environment:
-      APP_MODE: worker
-      CONSUMER_TOPIC: ticket_retry
-      DATABASE_URL: ${DATABASE_URL:?required}
-      RABBITMQ_HOST: rabbitmq
-    depends_on:
-      api: { condition: service_started }
-    command: ['node', 'dist/app.js']
 volumes:
   postgres_data:
   rabbitmq_data:

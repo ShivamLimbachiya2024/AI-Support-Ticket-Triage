@@ -4,6 +4,8 @@ import { QueueName } from './enums';
 
 let connection: ChannelModel | undefined;
 let channel: ConfirmChannel | undefined;
+const retryDelayMinMs = 30_000;
+const retryDelayMaxMs = 120_000;
 
 /** Connect to RabbitMQ and declare the application's durable queues. */
 export const connectRabbitMq = async (): Promise<ConfirmChannel> => {
@@ -17,10 +19,16 @@ export const connectRabbitMq = async (): Promise<ConfirmChannel> => {
   connection = rabbitConnection;
   const rabbitChannel = await rabbitConnection.createConfirmChannel();
 
-  await Promise.all([
-    rabbitChannel.assertQueue(QueueName.TICKET_PROCESSING, { durable: true }),
-    rabbitChannel.assertQueue(QueueName.TICKET_RETRY, { durable: true }),
-  ]);
+  // Quorum queue delivery counts drive RabbitMQ's native delayed retry policy.
+  await rabbitChannel.assertQueue(QueueName.TICKET_PROCESSING, {
+    durable: true,
+    arguments: {
+      'x-queue-type': 'quorum',
+      'x-delayed-retry-type': 'failed',
+      'x-delayed-retry-min': retryDelayMinMs,
+      'x-delayed-retry-max': retryDelayMaxMs,
+    },
+  });
 
   channel = rabbitChannel;
 

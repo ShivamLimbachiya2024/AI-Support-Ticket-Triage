@@ -5,11 +5,7 @@ import type { QueueMessage } from './types';
 export const sendToQueue = async (message: QueueMessage): Promise<void> => {
   const channel = getRabbitChannel();
 
-  const payload = {
-    action: message.action,
-    ...message.payload,
-    ...(message.delayMs !== undefined ? { availableAt: Date.now() + message.delayMs } : {}),
-  };
+  const payload = { action: message.action, ...message.payload };
 
   await new Promise<void>((resolve, reject) => {
     channel.sendToQueue(

@@ -5,7 +5,7 @@ import TriageResult from '../../../sequelize/models/triage_results.modal';
 import TicketStatusHistory from '../../../sequelize/models/ticket_status_history.modal';
 import { AuthRequest } from '../../../middleware';
 import { USER_ROLE } from '../../auth/enum/role';
-import { TRIAGE_STATUS } from '../enum';
+import { TRIAGE_STATUS, TICKET_STATUS_REASON } from '../enum';
 import { QueueAction, QueueName, sendToQueue } from '../../../rabbitmq';
 import type { ListTicketsQuery } from '../validation-schema';
 
@@ -38,7 +38,7 @@ export const submitTicket = async (req: AuthRequest, res: Response) => {
       {
         ticket_id: created.id,
         new_status: TRIAGE_STATUS.PENDING,
-        reason: 'Ticket submitted',
+        reason: TICKET_STATUS_REASON.SUBMITTED,
         retry_count: 0,
       },
       { transaction }

@@ -4,20 +4,18 @@ import { logger } from '../../logger';
 import db from '../../sequelize/models';
 import Ticket from '../../sequelize/models/tickets.modal';
 import TicketStatusHistory from '../../sequelize/models/ticket_status_history.modal';
-import { TRIAGE_STATUS } from '../../modules/tickets/enum';
+import { TRIAGE_STATUS, TICKET_STATUS_REASON } from '../../modules/tickets/enum';
 import { QueueAction, QueueName } from '../enums';
 import type { QueueHandler, QueuePayload } from '../types';
 import { queuePayloadSchema } from '../schemas';
 import { getRabbitChannel } from '../connection';
 import { processTicket } from '../handlers/ticketProcessing.handler';
-import { retryTicket } from '../handlers/ticketRetry.handler';
 import { sendToQueue } from '../publisher';
 
 const queueHandlers: Record<QueueName, Partial<Record<QueueAction, QueueHandler>>> = {
   [QueueName.TICKET_PROCESSING]: {
     [QueueAction.PROCESS_TICKET]: ({ ticketId }) => processTicket(ticketId),
   },
-  [QueueName.TICKET_RETRY]: { [QueueAction.RETRY_TICKET]: retryTicket },
 };
 
 /** Consume messages from one configured queue and dispatch only its handlers. */
@@ -38,20 +36,29 @@ export const startQueueWorker = async (queueName: QueueName): Promise<void> => {
 
     try {
       const { error, value } = queuePayloadSchema.validate(JSON.parse(message.content.toString()));
-      const payload = value as QueuePayload;
-      const handler = queueHandlers[queueName][payload.action];
 
-      if (error || !handler) {
+      if (error) {
         logger.error(`Invalid message received from ${queueName}`);
-        channel.nack(message, false, false);
+        channel.reject(message, false);
         return;
       }
 
-      await handler(payload);
-      channel.ack(message);
+      const payload = value as QueuePayload;
+      const handler = queueHandlers[queueName][payload.action];
+
+      if (!handler) {
+        logger.error(`Unsupported action received from ${queueName}`);
+        channel.reject(message, false);
+        return;
+      }
+
+      const shouldRetry = await handler(payload);
+
+      if (shouldRetry) channel.reject(message, true);
+      else channel.ack(message);
     } catch (error) {
       logger.error(`Queue ${queueName} message failed: ${(error as Error).message}`);
-      channel.nack(message, false, true);
+      channel.reject(message, true);
     }
   });
 };
@@ -83,7 +90,7 @@ const recoverStaleTickets = async (): Promise<void> => {
         return;
 
       ticket.triage_status = TRIAGE_STATUS.PENDING;
-      ticket.status_reason = 'Previous processing attempt timed out';
+      ticket.status_reason = TICKET_STATUS_REASON.PROCESSING_TIMEOUT;
       await ticket.save({ transaction });
 
       await TicketStatusHistory.create(

@@ -7,7 +7,6 @@ export const queuePayloadSchema = Joi.object({
     .valid(...Object.values(QueueAction))
     .required(),
   ticketId: Joi.number().integer().positive().required(),
-  availableAt: Joi.number().integer().optional(),
 })
   .required()
   .unknown(false);

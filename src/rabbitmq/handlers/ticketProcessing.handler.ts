@@ -5,47 +5,56 @@ import TriageResult from '../../sequelize/models/triage_results.modal';
 import TicketStatusHistory from '../../sequelize/models/ticket_status_history.modal';
 import TicketEmbedding from '../../sequelize/models/ticket_embeddings.modal';
 import { EMBEDDING_MODEL, MODEL_NAME, PROMPT_VERSION } from '../../config';
-import { TRIAGE_STATUS } from '../../modules/tickets/enum';
+import {
+  TRIAGE_STATUS,
+  TICKET_STATUS_REASON,
+  ticketProcessingReasonByPreviousStatus,
+} from '../../modules/tickets/enum';
 import { logger } from '../../logger';
-import { QueueAction, QueueName } from '../enums';
-import { sendToQueue } from '../publisher';
 import { cachedTriage, embedText } from '../triage';
-import { retryDelayMs } from '../../utils/retry';
 
 /**
  * Claim and triage a ticket. The row lock is released before model inference.
  * processing_attempt fences completions from stale worker deliveries.
  */
-export const processTicket = async (ticketId: number): Promise<void> => {
+export const processTicket = async (ticketId: number): Promise<boolean> => {
   let processingAttempt: number | undefined;
 
   await db.transaction(async (transaction) => {
     const ticket = await Ticket.findByPk(ticketId, { lock: transaction.LOCK.UPDATE, transaction });
 
-    if (!ticket || ticket.triage_status !== TRIAGE_STATUS.PENDING) return;
+    if (
+      !ticket ||
+      (ticket.triage_status !== TRIAGE_STATUS.PENDING &&
+        ticket.triage_status !== TRIAGE_STATUS.RETRY_WAIT)
+    )
+      return;
+
+    const previousStatus = ticket.triage_status;
 
     ticket.triage_status = TRIAGE_STATUS.PROCESSING;
     ticket.processing_attempt += 1;
     ticket.processing_started_at = new Date();
+    if (previousStatus === TRIAGE_STATUS.RETRY_WAIT) ticket.last_retry_at = new Date();
     processingAttempt = ticket.processing_attempt;
     await ticket.save({ transaction });
 
     await TicketStatusHistory.create(
       {
         ticket_id: ticketId,
-        previous_status: TRIAGE_STATUS.PENDING,
+        previous_status: previousStatus,
         new_status: TRIAGE_STATUS.PROCESSING,
-        reason: 'Processing started',
+        reason: ticketProcessingReasonByPreviousStatus[previousStatus],
         retry_count: ticket.retry_count,
       },
       { transaction }
     );
   });
 
-  if (processingAttempt === undefined) return;
+  if (processingAttempt === undefined) return false;
 
   const ticket = await Ticket.findByPk(ticketId);
-  if (!ticket) return;
+  if (!ticket) return false;
 
   try {
     logger.info(`Ticket ${ticketId} triage validation started`);
@@ -77,7 +86,7 @@ export const processTicket = async (ticketId: number): Promise<void> => {
       });
 
       currentTicket.triage_status = TRIAGE_STATUS.TRIAGED;
-      currentTicket.status_reason = 'Triage completed';
+      currentTicket.status_reason = TICKET_STATUS_REASON.TRIAGE_COMPLETED;
       currentTicket.completed_at = new Date();
       await currentTicket.save({ transaction });
 
@@ -86,7 +95,7 @@ export const processTicket = async (ticketId: number): Promise<void> => {
           ticket_id: ticketId,
           previous_status: TRIAGE_STATUS.PROCESSING,
           new_status: TRIAGE_STATUS.TRIAGED,
-          reason: 'Triage completed',
+          reason: TICKET_STATUS_REASON.TRIAGE_COMPLETED,
           retry_count: currentTicket.retry_count,
         },
         { transaction }
@@ -95,9 +104,11 @@ export const processTicket = async (ticketId: number): Promise<void> => {
 
     logger.info(`Ticket ${ticketId} triage completed successfully`);
     await detectDuplicate({ ticket, ticketId });
+    return false;
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'Provider failure';
     const invalidOutput = reason.startsWith('Invalid model output');
+    let shouldRetry = false;
 
     await db.transaction(async (transaction) => {
       const currentTicket = await Ticket.findByPk(ticketId, {
@@ -113,6 +124,7 @@ export const processTicket = async (ticketId: number): Promise<void> => {
         return;
 
       const canRetry = !invalidOutput && currentTicket.retry_count < 3;
+      shouldRetry = canRetry;
       currentTicket.triage_status = canRetry
         ? TRIAGE_STATUS.RETRY_WAIT
         : TRIAGE_STATUS.MANUAL_REVIEW;
@@ -131,18 +143,10 @@ export const processTicket = async (ticketId: number): Promise<void> => {
         },
         { transaction }
       );
-
-      if (canRetry) {
-        await sendToQueue({
-          queueName: QueueName.TICKET_RETRY,
-          action: QueueAction.RETRY_TICKET,
-          payload: { ticketId },
-          delayMs: retryDelayMs(currentTicket.retry_count),
-        });
-      }
     });
 
     logger.error(`Ticket ${ticketId} processing failed: ${reason}`);
+    return shouldRetry;
   }
 };
 
