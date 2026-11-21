@@ -7,6 +7,7 @@ import User from '../sequelize/models/users.modal';
 export interface AuthRequest extends Request {
   userId?: number;
   role?: string;
+  validatedQuery?: unknown;
 }
 export const validate =
   (schema: Joi.ObjectSchema) => (req: Request, res: Response, next: NextFunction) => {
@@ -18,6 +19,24 @@ export const validate =
     req.body = value;
     next();
   };
+
+export const validateQuery =
+  (schema: Joi.ObjectSchema) => (req: AuthRequest, res: Response, next: NextFunction) => {
+    const { error, value } = schema.validate(req.query, {
+      abortEarly: false,
+      convert: true,
+      allowUnknown: false,
+    });
+
+    if (error) {
+      res.status(400).json({ message: error.message });
+      return;
+    }
+
+    req.validatedQuery = value;
+    next();
+  };
+
 export const authenticate = async (req: AuthRequest, res: Response, next: NextFunction) => {
   const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '');
   if (!token) {

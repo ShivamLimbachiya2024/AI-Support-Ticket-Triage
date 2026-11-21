@@ -1,13 +1,13 @@
 import { Response } from 'express';
-import _ from 'lodash';
 import db from '../../../sequelize/models';
 import Ticket from '../../../sequelize/models/tickets.modal';
 import TriageResult from '../../../sequelize/models/triage_results.modal';
 import TicketStatusHistory from '../../../sequelize/models/ticket_status_history.modal';
 import { AuthRequest } from '../../../middleware';
 import { USER_ROLE } from '../../auth/enum/role';
-import { TRIAGE_STATUS, TICKET_CATEGORY, TICKET_PRIORITY } from '../enum';
+import { TRIAGE_STATUS } from '../enum';
 import { QueueAction, QueueName, sendToQueue } from '../../../rabbitmq';
+import type { ListTicketsQuery } from '../validation-schema';
 
 export const submitTicket = async (req: AuthRequest, res: Response) => {
   const ticket = await db.transaction(async (transaction) => {
@@ -61,23 +61,7 @@ export const listTickets = async (req: AuthRequest, res: Response) => {
     res.status(403).json({ message: 'Support access required' });
     return;
   }
-  const status = String(req.query.status || '');
-  const category = String(req.query.category || '');
-  const priority = String(req.query.priority || '');
-  if (
-    (status && !_.values(TRIAGE_STATUS).includes(status as TRIAGE_STATUS)) ||
-    (category && !_.values(TICKET_CATEGORY).includes(category as TICKET_CATEGORY)) ||
-    (priority && !_.values(TICKET_PRIORITY).includes(priority as TICKET_PRIORITY))
-  ) {
-    res.status(400).json({ message: 'Invalid filter' });
-    return;
-  }
-  const page = Number(req.query.page || 1);
-  const limit = Number(req.query.limit || 20);
-  if (!Number.isInteger(page) || page < 1 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
-    res.status(400).json({ message: 'Invalid pagination' });
-    return;
-  }
+  const { status, category, priority, page, limit } = req.validatedQuery as ListTicketsQuery;
   const resultWhere: Record<string, string> = {};
   if (category) resultWhere.category = category;
   if (priority) resultWhere.priority = priority;
