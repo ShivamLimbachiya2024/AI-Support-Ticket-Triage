@@ -1,7 +1,9 @@
 import { Table, Model, Column } from 'sequelize-typescript';
 import { DataTypes } from 'sequelize';
+import type ITicket from '../interface/tickets.interface';
+
 @Table({ tableName: 'tickets', underscored: true })
-export default class Ticket extends Model {
+export default class Ticket extends Model implements ITicket {
   @Column({ type: DataTypes.BIGINT, primaryKey: true, autoIncrement: true }) declare id: number;
   @Column({ type: DataTypes.BIGINT, allowNull: false }) declare customer_id: number;
   @Column({ type: DataTypes.STRING, allowNull: false }) declare subject: string;

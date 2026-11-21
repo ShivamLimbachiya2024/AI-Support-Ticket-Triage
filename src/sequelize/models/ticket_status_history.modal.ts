@@ -1,7 +1,9 @@
 import { Table, Model, Column } from 'sequelize-typescript';
 import { DataTypes } from 'sequelize';
+import type ITicketStatusHistory from '../interface/ticket_status_history.interface';
+
 @Table({ tableName: 'ticket_status_history', underscored: true })
-export default class TicketStatusHistory extends Model {
+export default class TicketStatusHistory extends Model implements ITicketStatusHistory {
   @Column({ type: DataTypes.BIGINT, primaryKey: true, autoIncrement: true }) declare id: number;
   @Column({ type: DataTypes.BIGINT, allowNull: false }) declare ticket_id: number;
   @Column({ type: DataTypes.STRING, allowNull: true }) declare previous_status: string | null;
