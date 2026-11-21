@@ -1,0 +1,80 @@
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?required}
+      POSTGRES_USER: ${POSTGRES_USER:?required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB']
+      interval: 5s
+      retries: 12
+  rabbitmq:
+    image: rabbitmq:4.3.7-management
+    pull_policy: never
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?required}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?required}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 5s
+      retries: 12
+  api:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    env_file: .env
+    environment:
+      APP_MODE: api
+      DATABASE_URL: ${DATABASE_URL:?required}
+      RABBITMQ_HOST: rabbitmq
+    ports:
+      - '${PORT:?required}:${PORT:?required}'
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    command:
+      [
+        'sh',
+        '-c',
+        'npx sequelize-cli db:migrate && npx sequelize-cli db:seed:all && node dist/app.js',
+      ]
+  processing_worker:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    env_file: .env
+    environment:
+      APP_MODE: worker
+      CONSUMER_TOPIC: ticket_processing
+      DATABASE_URL: ${DATABASE_URL:?required}
+      RABBITMQ_HOST: rabbitmq
+    depends_on:
+      api: { condition: service_started }
+    command: ['node', 'dist/app.js']
+  retry_worker:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    env_file: .env
+    environment:
+      APP_MODE: worker
+      CONSUMER_TOPIC: ticket_retry
+      DATABASE_URL: ${DATABASE_URL:?required}
+      RABBITMQ_HOST: rabbitmq
+    depends_on:
+      api: { condition: service_started }
+    command: ['node', 'dist/app.js']
+volumes:
+  postgres_data:
+  rabbitmq_data:

@@ -1,10 +1,7 @@
 import { Router } from 'express';
-import authRouter from '../modules/auth/router';
-
-const router: Router = Router();
-
-const API = '/api';
-
-router.use(`${API}`, authRouter);
-
+import auth from '../modules/auth/router';
+import tickets from '../modules/tickets/router';
+const router = Router();
+router.use('/api', auth);
+router.use('/api', tickets);
 export default router;

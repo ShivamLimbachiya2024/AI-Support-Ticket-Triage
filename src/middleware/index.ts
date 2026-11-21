@@ -1,42 +1,69 @@
-import { NextFunction, Request, Response } from "express";
-import Joi, { ObjectSchema } from "joi";
-import generalResponse from "../helper";
-import { JWT_SECRET } from "../config";
-import { Strategy } from "passport-jwt";
-import passport from "passport";
-
-export const validationMiddleware = (schema: ObjectSchema, context?: Joi.Context) => {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const { error } = schema.validate(req.body, { abortEarly: false, context },);
+import { NextFunction, Request, Response } from 'express';
+import Joi from 'joi';
+import jwt from 'jsonwebtoken';
+import { JWT_SECRET } from '../config';
+import { logger } from '../logger';
+import User from '../sequelize/models/users.modal';
+export interface AuthRequest extends Request {
+  userId?: number;
+  role?: string;
+}
+export const validate =
+  (schema: Joi.ObjectSchema) => (req: Request, res: Response, next: NextFunction) => {
+    const { error, value } = schema.validate(req.body, { abortEarly: false, stripUnknown: true });
     if (error) {
-      return generalResponse({
-        response: res,
-        message: error.message,
-        response_type: "failure",
-        statusCode: 400,
-      });
+      res.status(400).json({ message: error.message });
+      return;
     }
+    req.body = value;
     next();
   };
-};
-
-const cookieExtractor = (req: Request) => {
-  let token = null;
-  if (req && req.cookies) {
-    token = req.cookies["token"];
+export const authenticate = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '');
+  if (!token) {
+    res.status(401).json({ message: 'Authentication required' });
+    return;
   }
-  return token;
-};
-const options = {
-  jwtFromRequest: cookieExtractor,
-  secretOrKey: JWT_SECRET,
-};
-const jwtStrategy = new Strategy(options, (payload, next) => {
-  if (payload) {
-    return next(null, payload.id);
-  } else {
-    return next(null, false);
+  let payload: { id: number; role: string };
+  try {
+    payload = jwt.verify(token, JWT_SECRET) as { id: number; role: string };
+  } catch {
+    res.status(401).json({ message: 'Invalid token' });
+    return;
   }
-});
-export default passport.use(jwtStrategy);
-
+  const user = await User.findByPk(payload.id);
+  if (!user) {
+    res.status(401).json({ message: 'Account not found' });
+    return;
+  }
+  req.userId = Number(user.id);
+  req.role = user.role;
+  next();
+};
+export const requestLog = (req: Request, res: Response, next: NextFunction) => {
+  const started = Date.now();
+  res.on('finish', () =>
+    logger.info(
+      req.method +
+        ' ' +
+        req.originalUrl +
+        ' from ' +
+        req.ip +
+        ' returned ' +
+        res.statusCode +
+        ' in ' +
+        (Date.now() - started) +
+        'ms'
+    )
+  );
+  next();
+};
+export const errorHandler = (
+  error: Error,
+  req: Request,
+  res: Response,
+  nextFunction: NextFunction
+) => {
+  logger.error(req.method + ' ' + req.originalUrl + ' failed: ' + error.message);
+  if (!res.headersSent) res.status(500).json({ message: 'Internal server error' });
+};
