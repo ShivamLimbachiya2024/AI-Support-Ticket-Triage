@@ -106,7 +106,21 @@ export const getTicket = async (req: AuthRequest, res: Response) => {
   }
 
   logger.info(`Request ${requestId} triage result lookup started for ticket ${ticket.id}`);
-  const result = await TriageResult.findOne({ where: { ticket_id: ticket.id } });
+  const result = await TriageResult.findOne({
+    where: { ticket_id: ticket.id },
+    attributes: [
+      'id',
+      'ticket_id',
+      'category',
+      'priority',
+      'summary',
+      'model_name',
+      'prompt_version',
+      'source',
+      'createdAt',
+      'updatedAt',
+    ],
+  });
   logger.info(
     `Request ${requestId} triage result lookup completed for ticket ${ticket.id}: ${result ? 'result found' : 'result not available'}`
   );

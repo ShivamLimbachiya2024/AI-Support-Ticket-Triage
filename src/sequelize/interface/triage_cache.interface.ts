@@ -6,6 +6,7 @@ export default interface ITriageCache {
   category: string;
   priority: string;
   summary: string;
+  confidence?: number | null;
   created_at?: Date;
   updated_at?: Date;
 }

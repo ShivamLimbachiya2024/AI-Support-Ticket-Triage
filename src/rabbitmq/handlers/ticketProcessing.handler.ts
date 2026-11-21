@@ -11,7 +11,8 @@ import {
   ticketProcessingReasonByPreviousStatus,
 } from '../../modules/tickets/enum';
 import { logger } from '../../logger';
-import { cachedTriage, embedText } from '../triage';
+import { classifyProviderError } from '../../utils/retry';
+import { cachedTriage, embedText, verifySemanticReuse, SEMANTIC_REUSE_THRESHOLD } from '../triage';
 
 /**
  * Claim and triage a ticket. The row lock is released before model inference.
@@ -41,7 +42,6 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
       );
       return;
     }
-
     const previousStatus = ticket.triage_status;
 
     logger.info(
@@ -91,7 +91,11 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
 
   try {
     logger.info(`Ticket ${ticketId} triage validation started`);
-    const triageResult = await cachedTriage({ subject: ticket.subject, body: ticket.body });
+    const triageResult = await cachedTriage({
+      subject: ticket.subject,
+      body: ticket.body,
+      findSimilar: () => findSemanticTriage({ ticket, ticketId }),
+    });
     logger.info(
       `Ticket ${ticketId} triage result ready: category ${triageResult.result.category}, priority ${triageResult.result.priority}, source ${triageResult.source}`
     );
@@ -133,8 +137,11 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
       logger.info(
         `Ticket ${ticketId} status transition started: ${TRIAGE_STATUS.PROCESSING} to ${TRIAGE_STATUS.TRIAGED}`
       );
-      currentTicket.triage_status = TRIAGE_STATUS.TRIAGED;
-      currentTicket.status_reason = TICKET_STATUS_REASON.TRIAGE_COMPLETED;
+      const confident = (triageResult.result.confidence ?? 0) >= 0.85;
+      currentTicket.triage_status = confident ? TRIAGE_STATUS.TRIAGED : TRIAGE_STATUS.MANUAL_REVIEW;
+      currentTicket.status_reason = confident
+        ? TICKET_STATUS_REASON.TRIAGE_COMPLETED
+        : 'Low classification confidence';
       currentTicket.completed_at = new Date();
       await currentTicket.save({ transaction });
       logger.info(`Ticket ${ticketId} status updated to ${TRIAGE_STATUS.TRIAGED}`);
@@ -144,8 +151,8 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         {
           ticket_id: ticketId,
           previous_status: TRIAGE_STATUS.PROCESSING,
-          new_status: TRIAGE_STATUS.TRIAGED,
-          reason: TICKET_STATUS_REASON.TRIAGE_COMPLETED,
+          new_status: currentTicket.triage_status,
+          reason: currentTicket.status_reason,
           retry_count: currentTicket.retry_count,
         },
         { transaction }
@@ -170,6 +177,9 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'Provider failure';
     const invalidOutput = reason.startsWith('Invalid model output');
+    const failure = invalidOutput
+      ? { kind: 'invalidRequest' as const }
+      : classifyProviderError({ error });
     let shouldRetry = false;
 
     logger.error(`Ticket ${ticketId} triage attempt failed: ${reason}`);
@@ -192,14 +202,15 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         return;
       }
 
-      const canRetry = !invalidOutput && currentTicket.retry_count < 3;
+      const canRetry =
+        (failure.kind === 'transient' || failure.kind === 'rateLimit') &&
+        currentTicket.retry_count < 3;
       shouldRetry = canRetry;
       const previousStatus = currentTicket.triage_status;
       currentTicket.triage_status = canRetry
         ? TRIAGE_STATUS.RETRY_WAIT
         : TRIAGE_STATUS.MANUAL_REVIEW;
       currentTicket.status_reason = reason;
-
       if (canRetry) currentTicket.retry_count += 1;
 
       logger.info(
@@ -232,6 +243,48 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
     }
     return shouldRetry;
   }
+};
+
+/** Find a same-customer, previously verified result for guarded reuse. */
+export const findSemanticTriage = async ({
+  ticket,
+  ticketId,
+}: {
+  ticket: Ticket;
+  ticketId: number;
+}): Promise<import('../types').TriageOutput | null> => {
+  const vector = await embedText({ subject: ticket.subject, body: ticket.body });
+  const candidates = await Ticket.findAll({
+    where: {
+      customer_id: ticket.customer_id,
+      id: { [Op.ne]: ticketId },
+      triage_status: TRIAGE_STATUS.TRIAGED,
+    },
+    attributes: ['id'],
+  });
+  if (candidates.length === 0) return null;
+  const { cosineDistance } = await import('pgvector/sequelize');
+  const cosineDistanceExpression = cosineDistance('embedding', vector, db);
+  const closest = await TicketEmbedding.findOne({
+    where: {
+      ticket_id: { [Op.in]: candidates.map((candidate) => Number(candidate.id)) },
+      embedding_model: EMBEDDING_MODEL,
+    },
+    attributes: ['ticket_id', [cosineDistanceExpression, 'cosineDistance']],
+    order: [[cosineDistanceExpression, 'ASC']],
+  });
+  if (!closest) return null;
+  const similarity = 1 - Number(closest.get('cosineDistance'));
+  if (!Number.isFinite(similarity) || similarity < SEMANTIC_REUSE_THRESHOLD) return null;
+  const previous = await TriageResult.findOne({
+    where: { ticket_id: closest.ticket_id, model_name: MODEL_NAME, prompt_version: PROMPT_VERSION },
+  });
+  if (!previous || (previous.confidence ?? 0) < 0.85) return null;
+  return verifySemanticReuse({
+    ticket: { subject: ticket.subject, body: ticket.body },
+    category: previous.category as import('../../modules/tickets/enum').TICKET_CATEGORY,
+    priority: previous.priority as import('../../modules/tickets/enum').TICKET_PRIORITY,
+  });
 };
 
 /** Store an embedding and link the closest open ticket for the same customer. */
@@ -286,9 +339,11 @@ const detectDuplicate = async ({
 
     logger.info(`Ticket ${ticketId} nearest embedding search started`);
     const { cosineDistance } = await import('pgvector/sequelize');
+    const cosineDistanceExpression = cosineDistance('embedding', vector, db);
     const closest = await TicketEmbedding.findOne({
       where: { ticket_id: { [Op.in]: candidateIds }, embedding_model: EMBEDDING_MODEL },
-      order: [[cosineDistance('embedding', vector, db), 'ASC']],
+      attributes: ['ticket_id', [cosineDistanceExpression, 'cosineDistance']],
+      order: [[cosineDistanceExpression, 'ASC']],
     });
 
     if (!closest) {
@@ -298,7 +353,13 @@ const detectDuplicate = async ({
       return;
     }
 
-    const similarity = cosineSimilarity(vector, closest.embedding);
+    const similarity = 1 - Number(closest.get('cosineDistance'));
+    if (!Number.isFinite(similarity)) {
+      logger.warn(
+        `Ticket ${ticketId} duplicate detection skipped because cosine distance was invalid`
+      );
+      return;
+    }
     logger.info(
       `Ticket ${ticketId} closest candidate is ${closest.ticket_id} with similarity ${similarity.toFixed(4)}`
     );
@@ -317,18 +378,4 @@ const detectDuplicate = async ({
   } catch (error) {
     logger.error(`Ticket ${ticketId} duplicate detection failed: ${(error as Error).message}`);
   }
-};
-
-/** Compare normalized vectors using cosine similarity. */
-export const cosineSimilarity = (firstVector: number[], secondVector: number[]): number => {
-  const dotProduct = firstVector.reduce(
-    (sum, value, index) => sum + value * secondVector[index],
-    0
-  );
-  const firstNorm = Math.sqrt(firstVector.reduce((sum, value) => sum + value * value, 0));
-  const secondNorm = Math.sqrt(secondVector.reduce((sum, value) => sum + value * value, 0));
-
-  if (firstNorm === 0 || secondNorm === 0) return 0;
-
-  return dotProduct / (firstNorm * secondNorm);
 };

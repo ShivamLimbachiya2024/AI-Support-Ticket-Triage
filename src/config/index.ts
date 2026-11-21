@@ -39,8 +39,8 @@ export const RABBITMQ_PASSWORD = requireValue('RABBITMQ_PASSWORD', environment.r
 export const MODEL_PROVIDER = requireValue('MODEL_PROVIDER', environment.modelProvider);
 export const MODEL_NAME = requireValue('MODEL_NAME', environment.modelName);
 export const EMBEDDING_MODEL = requireValue('EMBEDDING_MODEL', environment.embeddingModel);
-const configured_prompt_version = requireValue('PROMPT_VERSION', environment.promptVersion);
-export const PROMPT_VERSION = `${configured_prompt_version}-verified-v2`;
+const configuredPromptVersion = requireValue('PROMPT_VERSION', environment.promptVersion);
+export const PROMPT_VERSION = `${configuredPromptVersion}-confidence-english-v3`;
 export const CONSUMER_TOPIC = environment.consumerTopic;
 export const GEMINI_API_KEY = environment.geminiApiKey;
 

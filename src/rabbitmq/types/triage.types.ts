@@ -4,10 +4,12 @@ export interface TriageOutput {
   category: TICKET_CATEGORY;
   priority: TICKET_PRIORITY;
   summary: string;
+  confidence?: number;
 }
 
 export interface TriageCandidate extends TriageOutput {
   evidence: string[];
+  confidence: number;
 }
 
 export interface TriageJudgeResult {
@@ -25,6 +27,7 @@ export interface GeminiSchemaTypes {
   STRING: string;
   ARRAY: string;
   BOOLEAN: string;
+  NUMBER: string;
 }
 
 export interface GeminiClient {

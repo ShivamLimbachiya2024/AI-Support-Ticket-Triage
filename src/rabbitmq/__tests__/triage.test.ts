@@ -50,13 +50,16 @@ test('accepts a candidate only when its evidence is copied from the source ticke
         priority: TICKET_PRIORITY.MEDIUM,
         summary: 'The customer requests a refund for their last payment.',
         evidence: ['refund my last payment'],
+        confidence: 0.9,
       },
     })
   ).toEqual({
     category: TICKET_CATEGORY.BILLING,
     priority: TICKET_PRIORITY.MEDIUM,
     summary: 'The customer requests a refund for their last payment.',
+    confidence: 0.9,
     evidence: ['refund my last payment'],
+    confidence: 0.9,
   });
 });
 
@@ -69,6 +72,7 @@ test('rejects evidence that does not occur verbatim in the source ticket', () =>
         priority: TICKET_PRIORITY.URGENT,
         summary: 'The customer reports a security breach.',
         evidence: ['security breach'],
+        confidence: 0.9,
       },
     })
   ).toThrow('evidence must quote the source ticket exactly');
@@ -83,6 +87,7 @@ test('rejects a multi-sentence summary even when the output shape and evidence a
         priority: TICKET_PRIORITY.MEDIUM,
         summary: 'The customer requests a refund. They need it today.',
         evidence: ['refund my last payment'],
+        confidence: 0.9,
       },
     })
   ).toThrow('summary must be one sentence');
@@ -93,7 +98,9 @@ test('retries a semantically rejected candidate and accepts a later verified res
     category: TICKET_CATEGORY.BILLING,
     priority: TICKET_PRIORITY.MEDIUM,
     summary: 'The customer requests a refund for their last payment.',
+    confidence: 0.9,
     evidence: ['refund my last payment'],
+    confidence: 0.9,
   };
   const generateCandidate = jest.fn(async () => candidate);
   const judgeCandidate = jest
@@ -114,6 +121,7 @@ test('retries a semantically rejected candidate and accepts a later verified res
     category: TICKET_CATEGORY.BILLING,
     priority: TICKET_PRIORITY.MEDIUM,
     summary: 'The customer requests a refund for their last payment.',
+    confidence: 0.9,
   });
   expect(generateCandidate).toHaveBeenCalledTimes(2);
   expect(generateCandidate.mock.calls[1][0].correctionReason).toContain('unsupported fact');

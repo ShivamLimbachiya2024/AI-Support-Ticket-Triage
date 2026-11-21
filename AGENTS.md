@@ -14,7 +14,7 @@ This is a TypeScript Express backend for support ticket triage. Keep code organi
 - `src/middleware/`: shared Express middleware.
 - `src/helper/`, `src/utils/`, and `src/config/`: shared response helpers, utilities, and configuration.
 
-Use the existing naming and import conventions in neighboring files. Model files currently use the `.modal.ts` suffix; preserve that convention unless the repository is deliberately renamed consistently. Keep code readable and maintainable as the primary goal. Do not add unnecessary normalization or transformations. Use `_` or `-` as separators in keys and identifiers where applicable; do not use `:` as a separator. Use `snake_case` for database column names and other variable names, following that convention consistently across interfaces, model attributes, and queries.
+Use the existing naming and import conventions in neighboring files. Model files currently use the `.modal.ts` suffix; preserve that convention unless the repository is deliberately renamed consistently. Keep code readable and maintainable as the primary goal. Do not add unnecessary normalization or transformations. Use `camelCase` for all non-database variables, function names, parameters, and TypeScript properties. Use `snake_case` only for database columns and model/interface attributes that map directly to database columns; keep those names consistent across model definitions, interfaces, and queries. Preserve external API or provider field names when the contract requires them.
 
 ## Required database and migration practices
 
@@ -31,6 +31,7 @@ Use the existing naming and import conventions in neighboring files. Model files
 
 ## Required implementation practices
 
+- After every file edit, run Prettier on that file before editing another file. This applies to source files, tests, migrations, configuration, and documentation.
 - Validate every submitted POST/request body with Joi before controller logic. Put schemas in the feature's `validation-schema/` folder and apply the shared validation middleware in the route.
 - Use Lodash for object operations and manipulations; do not substitute plain JavaScript object helpers for those operations.
 - Avoid regular expressions. For simple string handling, use basic JavaScript string functions instead.
@@ -41,7 +42,7 @@ Use the existing naming and import conventions in neighboring files. Model files
 - When a function requires more than one parameter, accept a single named object parameter with clearly named fields instead of multiple positional, comma-separated parameters. This keeps call sites explicit and avoids assumptions based on argument order.
 - Avoid unnecessary helper functions, wrappers, or abstractions. Keep a small operation inline when it is only used once and is clear in place; extract a function when it improves readability or supports genuine reuse.
 - Avoid unnecessary normalization or transformation steps. Make only changes needed for the requirement and keep the data flow straightforward.
-- Prefer readable, maintainable code over clever or overly compact implementations. Apply `snake_case` to variables and database columns, and use `_` or `-` rather than `:` when separating keys or identifiers.
+- Prefer readable, maintainable code over clever or overly compact implementations. Apply `camelCase` to all non-database variables and identifiers. Use `snake_case` only for database columns and directly mapped model/interface attributes.
 
 ## Logging, errors, and request lifecycle
 
@@ -63,4 +64,4 @@ Use the existing naming and import conventions in neighboring files. Model files
 - Every newly defined function has a test that exercises it, and the tests are run.
 - Functions needing multiple inputs accept a named object parameter rather than multiple positional parameters.
 - Required environment variables have no implicit fallback values.
-- Naming follows the required separator and `snake_case` conventions. Code avoids unnecessary normalization, abstractions, and transformations, and remains easy to read and maintain.
+- Non-database variables and identifiers use `camelCase`; database columns and directly mapped model/interface attributes use `snake_case`. Code avoids unnecessary normalization, abstractions, and transformations, and remains easy to read and maintain.

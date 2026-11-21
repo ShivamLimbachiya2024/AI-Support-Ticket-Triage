@@ -11,6 +11,7 @@ export const resultSchema = Joi.object({
     .valid(..._.values(TICKET_PRIORITY))
     .required(),
   summary: Joi.string().min(1).max(500).required(),
+  confidence: Joi.number().min(0).max(1).optional(),
 })
   .required()
   .unknown(false);
@@ -25,6 +26,7 @@ export const modelCandidateSchema = Joi.object({
     .required(),
   summary: Joi.string().min(1).max(500).required(),
   evidence: Joi.array().items(Joi.string().min(1)).min(1).max(3).required(),
+  confidence: Joi.number().min(0).max(1).required(),
 })
   .required()
   .unknown(false);

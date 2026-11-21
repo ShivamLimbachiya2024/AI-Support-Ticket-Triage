@@ -7,6 +7,7 @@ export default interface ITriageResult {
   model_name: string;
   prompt_version: string;
   source: string;
+  confidence?: number | null;
   created_at?: Date;
   updated_at?: Date;
 }
