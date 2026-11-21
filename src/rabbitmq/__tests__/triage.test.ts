@@ -1,5 +1,15 @@
+jest.mock('../../config', () => ({
+  EMBEDDING_MODEL: 'fake_embedding_v1',
+  GEMINI_API_KEY: undefined,
+  MODEL_NAME: 'fake_v1',
+  MODEL_PROVIDER: 'fake',
+  PROMPT_VERSION: 'test_prompt_version',
+}));
+
 import {
+  EMBEDDING_DIMENSION,
   embedText,
+  formatEmbeddingText,
   runVerifiedTriage,
   triageText,
   validateCandidate,
@@ -146,9 +156,15 @@ test('fake provider returns valid triage without an API key', async () => {
   const result = await triageText({ subject: 'Need help', body: 'I have a question' });
   expect(result.category).toBe(TICKET_CATEGORY.OTHER);
 });
-test('fake embeddings are deterministic and 32 dimensional', async () => {
+test('fake embeddings are deterministic and use the configured vector dimension', async () => {
   const first = await embedText({ subject: 'Need help', body: 'I have a question' });
   const second = await embedText({ subject: 'Need help', body: 'I have a question' });
-  expect(first).toHaveLength(32);
+  expect(first).toHaveLength(EMBEDDING_DIMENSION);
   expect(first).toEqual(second);
+});
+
+test('formats embeddings for symmetric semantic similarity', () => {
+  expect(formatEmbeddingText({ subject: 'Password help', body: 'I cannot sign in.' })).toBe(
+    'task: sentence similarity | query: Password help\nI cannot sign in.'
+  );
 });

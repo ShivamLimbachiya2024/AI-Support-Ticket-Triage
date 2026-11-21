@@ -11,7 +11,7 @@ module.exports = {
         onDelete: 'CASCADE',
       },
       embedding_model: { type: Sequelize.STRING(100), allowNull: false },
-      embedding: { type: Sequelize.VECTOR(32), allowNull: false },
+      embedding: { type: Sequelize.VECTOR(1536), allowNull: false },
       created_at: { type: Sequelize.DATE, allowNull: false },
       updated_at: { type: Sequelize.DATE, allowNull: false },
     });

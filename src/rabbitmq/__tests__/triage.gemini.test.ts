@@ -1,3 +1,11 @@
+jest.mock('../../config', () => ({
+  EMBEDDING_MODEL: 'gemini-embedding-2',
+  GEMINI_API_KEY: 'test-gemini-key',
+  MODEL_NAME: 'gemini-4-carbon',
+  MODEL_PROVIDER: 'gemini',
+  PROMPT_VERSION: 'test_prompt_version',
+}));
+
 import { GEMINI_HTTP_OPTIONS, runGeminiTriage } from '../triage';
 import { TICKET_CATEGORY, TICKET_PRIORITY } from '../../modules/tickets/enum';
 
@@ -68,7 +76,7 @@ test('retries rejected Gemini output, isolates ticket data, and configures SDK t
   expect(mock_generate_content.mock.calls[1][0].config.systemInstruction).toContain(
     'independently verify'
   );
-  expect(JSON.parse(mock_generate_content.mock.calls[2][0].contents).correction_reason).toContain(
+  expect(JSON.parse(mock_generate_content.mock.calls[2][0].contents).correctionReason).toContain(
     'not urgency evidence'
   );
 });
