@@ -35,8 +35,10 @@ Use the existing naming and import conventions in neighboring files. Model files
 - Use Lodash for object operations and manipulations; do not substitute plain JavaScript object helpers for those operations.
 - Avoid regular expressions. For simple string handling, use basic JavaScript string functions instead.
 - Keep feature-specific routes, controllers, schemas, and enums in the corresponding feature module. Put cross-cutting behavior in shared middleware/helpers.
+- Keep tests in a dedicated `__tests__/` folder inside the module they cover (for example, `src/modules/tickets/__tests__/`). Do not place test cases in application business-logic files or alongside production files outside that test folder. Update relative imports when moving tests.
 - Preserve strict TypeScript typing and existing Express/Sequelize patterns.
 - After defining a function, add and run a test that exercises that function. Function-level test coverage is mandatory.
+- When a function requires more than one parameter, accept a single named object parameter with clearly named fields instead of multiple positional, comma-separated parameters. This keeps call sites explicit and avoids assumptions based on argument order.
 - Avoid unnecessary helper functions, wrappers, or abstractions. Keep a small operation inline when it is only used once and is clear in place; extract a function when it improves readability or supports genuine reuse.
 - Avoid unnecessary normalization or transformation steps. Make only changes needed for the requirement and keep the data flow straightforward.
 - Prefer readable, maintainable code over clever or overly compact implementations. Apply `snake_case` to variables and database columns, and use `_` or `-` rather than `:` when separating keys or identifiers.
@@ -52,11 +54,13 @@ Use the existing naming and import conventions in neighboring files. Model files
 ## Completion checklist
 
 - New routes validate input with Joi and follow the feature module structure.
+- Tests live in the relevant module's dedicated `__tests__/` folder, separate from application business logic files.
 - New statuses use shared feature enums while model/database columns remain strings.
 - Migrations were generated with Sequelize CLI at `src/sequelize/migrations` and use ORM/query-interface methods.
 - Models and interfaces are in their established directories and are registered where needed.
 - Global error handling and request/response logging remain in the Express middleware chain.
 - Operation logs are readable strings with relevant identifiers and outcomes.
 - Every newly defined function has a test that exercises it, and the tests are run.
+- Functions needing multiple inputs accept a named object parameter rather than multiple positional parameters.
 - Required environment variables have no implicit fallback values.
 - Naming follows the required separator and `snake_case` conventions. Code avoids unnecessary normalization, abstractions, and transformations, and remains easy to read and maintain.
