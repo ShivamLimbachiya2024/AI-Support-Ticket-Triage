@@ -12,6 +12,9 @@ import { getRabbitChannel } from '../connection';
 import { processTicket } from '../handlers/ticketProcessing.handler';
 import { sendToQueue } from '../publisher';
 
+const staleTicketRecoveryIntervalMs = 10 * 60 * 1000;
+const staleTicketTimeoutMs = 30 * 60 * 1000;
+
 const queueHandlers: Record<QueueName, Partial<Record<QueueAction, QueueHandler>>> = {
   [QueueName.TICKET_PROCESSING]: {
     [QueueAction.PROCESS_TICKET]: ({ ticketId }) => processTicket(ticketId),
@@ -26,12 +29,15 @@ export const startQueueWorker = async (queueName: QueueName): Promise<void> => {
   logger.info(`Consumer prefetch is ready for queue ${queueName}`);
 
   if (queueName === QueueName.TICKET_PROCESSING) {
-    logger.info(`Scheduling stale ticket recovery for queue ${queueName}`);
+    logger.info(`Scheduling stale ticket recovery every 10 minutes for queue ${queueName}`);
+    recoverStaleTickets().catch((error) =>
+      logger.error('Stale ticket recovery failed: ' + error.message)
+    );
     setInterval(() => {
       recoverStaleTickets().catch((error) =>
         logger.error('Stale ticket recovery failed: ' + error.message)
       );
-    }, 10000);
+    }, staleTicketRecoveryIntervalMs);
   }
 
   logger.info(`Registering consumer for queue ${queueName}`);
@@ -98,7 +104,7 @@ export const startQueueWorker = async (queueName: QueueName): Promise<void> => {
 
 /** Requeue processing tickets abandoned by a crashed worker. */
 const recoverStaleTickets = async (): Promise<void> => {
-  const staleBefore = new Date(Date.now() - 180000);
+  const staleBefore = new Date(Date.now() - staleTicketTimeoutMs);
   logger.debug('Stale ticket recovery scan started');
   const staleTickets = await Ticket.findAll({
     where: {
