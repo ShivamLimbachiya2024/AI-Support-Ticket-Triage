@@ -54,7 +54,7 @@ test('retries rejected Gemini output, isolates ticket data, and configures SDK t
     summary: 'The customer requests help resetting a password.',
   });
   expect(GEMINI_HTTP_OPTIONS).toEqual({
-    timeout: 8000,
+    timeout: 30000,
     retryOptions: {
       attempts: 3,
       initialDelay: 0.5,
