@@ -9,27 +9,44 @@ import { errorHandler, requestLog } from './middleware';
 import { logger } from './logger';
 import { connectRabbitMq, QueueName, startQueueWorker } from './rabbitmq';
 const app = express();
+
+app.use(requestLog);
 app.use(cors({ origin: FRONT_URL, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
-app.use(requestLog);
 app.use(router);
 app.use(errorHandler);
 const start = async () => {
+  logger.info(`Application startup started in ${APP_MODE} mode`);
+  logger.info('PostgreSQL connection check started');
   await db.authenticate();
   logger.info('PostgreSQL connection established');
+
+  logger.info('RabbitMQ connection setup started');
   await connectRabbitMq();
+  logger.info('RabbitMQ connection setup completed');
 
   if (APP_MODE === 'worker') {
+    logger.info(`Resolving worker queue from CONSUMER_TOPIC=${CONSUMER_TOPIC}`);
     const queueName = Object.values(QueueName).find((queue) => queue === CONSUMER_TOPIC);
 
-    if (!queueName) throw new Error('CONSUMER_TOPIC must name a configured RabbitMQ queue');
+    if (!queueName) {
+      logger.error(
+        'Worker startup stopped because CONSUMER_TOPIC does not name a configured queue'
+      );
+      throw new Error('CONSUMER_TOPIC must name a configured RabbitMQ queue');
+    }
 
+    logger.info(`Starting the ${queueName} worker`);
     await startQueueWorker(queueName);
+    logger.info(`The ${queueName} worker started successfully`);
     return;
   }
 
-  if (APP_MODE === 'api') app.listen(PORT, () => logger.info('API listening on port ' + PORT));
+  if (APP_MODE === 'api') {
+    logger.info(`Starting API listener on port ${PORT}`);
+    app.listen(PORT, () => logger.info('API listening on port ' + PORT));
+  }
 };
 start().catch((error) => {
   logger.error('Startup failed: ' + error.message);

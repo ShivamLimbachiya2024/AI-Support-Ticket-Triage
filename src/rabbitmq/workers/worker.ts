@@ -21,9 +21,12 @@ const queueHandlers: Record<QueueName, Partial<Record<QueueAction, QueueHandler>
 /** Consume messages from one configured queue and dispatch only its handlers. */
 export const startQueueWorker = async (queueName: QueueName): Promise<void> => {
   const channel = getRabbitChannel();
+  logger.info(`Setting consumer prefetch to 1 for queue ${queueName}`);
   await channel.prefetch(1);
+  logger.info(`Consumer prefetch is ready for queue ${queueName}`);
 
   if (queueName === QueueName.TICKET_PROCESSING) {
+    logger.info(`Scheduling stale ticket recovery for queue ${queueName}`);
     setInterval(() => {
       recoverStaleTickets().catch((error) =>
         logger.error('Stale ticket recovery failed: ' + error.message)
@@ -31,15 +34,24 @@ export const startQueueWorker = async (queueName: QueueName): Promise<void> => {
     }, 10000);
   }
 
+  logger.info(`Registering consumer for queue ${queueName}`);
   await channel.consume(queueName, async (message: ConsumeMessage | null) => {
-    if (!message) return;
+    if (!message) {
+      logger.warn(`RabbitMQ cancelled the consumer for queue ${queueName}`);
+      return;
+    }
+
+    logger.info(`Message received from ${queueName}; redelivered=${message.fields.redelivered}`);
 
     try {
       const { error, value } = queuePayloadSchema.validate(JSON.parse(message.content.toString()));
 
       if (error) {
-        logger.error(`Invalid message received from ${queueName}`);
+        logger.error(
+          `Message from ${queueName} rejected because its payload did not match the queue schema`
+        );
         channel.reject(message, false);
+        logger.info(`Invalid message from ${queueName} rejected without requeue`);
         return;
       }
 
@@ -47,25 +59,47 @@ export const startQueueWorker = async (queueName: QueueName): Promise<void> => {
       const handler = queueHandlers[queueName][payload.action];
 
       if (!handler) {
-        logger.error(`Unsupported action received from ${queueName}`);
+        logger.error(
+          `Ticket ${payload.ticketId} message rejected because action ${payload.action} is not handled by ${queueName}`
+        );
         channel.reject(message, false);
+        logger.info(
+          `Unsupported action message for ticket ${payload.ticketId} rejected without requeue`
+        );
         return;
       }
 
+      logger.info(`Dispatching ${payload.action} for ticket ${payload.ticketId} from ${queueName}`);
       const shouldRetry = await handler(payload);
+      logger.info(
+        `Handler completed for ticket ${payload.ticketId}; delayed retry requested=${shouldRetry}`
+      );
 
-      if (shouldRetry) channel.reject(message, true);
-      else channel.ack(message);
+      if (shouldRetry) {
+        logger.info(
+          `Returning ticket ${payload.ticketId} to ${queueName} for RabbitMQ delayed retry`
+        );
+        channel.reject(message, true);
+        logger.info(`Ticket ${payload.ticketId} returned to RabbitMQ for delayed redelivery`);
+      } else {
+        logger.info(`Acknowledging completed message for ticket ${payload.ticketId}`);
+        channel.ack(message);
+        logger.info(`Message for ticket ${payload.ticketId} acknowledged`);
+      }
     } catch (error) {
-      logger.error(`Queue ${queueName} message failed: ${(error as Error).message}`);
+      logger.error(`Message processing from ${queueName} failed: ${(error as Error).message}`);
+      logger.info(`Returning failed ${queueName} message to RabbitMQ for delayed redelivery`);
       channel.reject(message, true);
+      logger.info(`Failed ${queueName} message returned to RabbitMQ`);
     }
   });
+  logger.info(`Consumer registered successfully for queue ${queueName}`);
 };
 
 /** Requeue processing tickets abandoned by a crashed worker. */
 const recoverStaleTickets = async (): Promise<void> => {
   const staleBefore = new Date(Date.now() - 180000);
+  logger.debug('Stale ticket recovery scan started');
   const staleTickets = await Ticket.findAll({
     where: {
       triage_status: TRIAGE_STATUS.PROCESSING,
@@ -74,25 +108,47 @@ const recoverStaleTickets = async (): Promise<void> => {
     attributes: ['id'],
   });
 
+  if (staleTickets.length === 0) {
+    logger.debug('Stale ticket recovery scan completed with no stale tickets');
+    return;
+  }
+
+  logger.info(`Stale ticket recovery found ${staleTickets.length} ticket(s)`);
+
   for (const staleTicket of staleTickets) {
+    const ticketId = Number(staleTicket.id);
+    logger.info(`Stale recovery transaction started for ticket ${ticketId}`);
     await db.transaction(async (transaction) => {
-      const ticket = await Ticket.findByPk(staleTicket.id, {
+      const ticket = await Ticket.findByPk(ticketId, {
         lock: transaction.LOCK.UPDATE,
         transaction,
       });
 
+      if (!ticket) {
+        logger.info(`Stale recovery skipped ticket ${ticketId} because it no longer exists`);
+        return;
+      }
+
       if (
-        !ticket ||
         ticket.triage_status !== TRIAGE_STATUS.PROCESSING ||
         !ticket.processing_started_at ||
         ticket.processing_started_at >= staleBefore
-      )
+      ) {
+        logger.info(
+          `Stale recovery skipped ticket ${ticketId} because its processing state changed`
+        );
         return;
+      }
 
+      logger.info(
+        `Stale ticket ${ticketId} transition started: ${TRIAGE_STATUS.PROCESSING} to ${TRIAGE_STATUS.PENDING}`
+      );
       ticket.triage_status = TRIAGE_STATUS.PENDING;
       ticket.status_reason = TICKET_STATUS_REASON.PROCESSING_TIMEOUT;
       await ticket.save({ transaction });
+      logger.info(`Stale ticket ${ticketId} status updated to ${TRIAGE_STATUS.PENDING}`);
 
+      logger.info(`Recording stale recovery status history for ticket ${ticketId}`);
       await TicketStatusHistory.create(
         {
           ticket_id: Number(ticket.id),
@@ -103,12 +159,17 @@ const recoverStaleTickets = async (): Promise<void> => {
         },
         { transaction }
       );
+      logger.info(`Stale recovery status history recorded for ticket ${ticketId}`);
 
+      logger.info(`Republishing ticket ${ticketId} to ${QueueName.TICKET_PROCESSING}`);
       await sendToQueue({
         queueName: QueueName.TICKET_PROCESSING,
         action: QueueAction.PROCESS_TICKET,
         payload: { ticketId: Number(ticket.id) },
       });
     });
+    logger.info(`Stale recovery transaction committed for ticket ${ticketId}`);
   }
+
+  logger.info(`Stale ticket recovery completed for ${staleTickets.length} ticket(s)`);
 };

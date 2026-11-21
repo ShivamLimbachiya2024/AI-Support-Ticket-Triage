@@ -18,27 +18,46 @@ import { cachedTriage, embedText } from '../triage';
  * processing_attempt fences completions from stale worker deliveries.
  */
 export const processTicket = async (ticketId: number): Promise<boolean> => {
+  logger.info(`Ticket ${ticketId} processing workflow started`);
   let processingAttempt: number | undefined;
 
+  logger.info(`Ticket ${ticketId} claim transaction started`);
   await db.transaction(async (transaction) => {
+    logger.info(`Ticket ${ticketId} row lock requested for processing claim`);
     const ticket = await Ticket.findByPk(ticketId, { lock: transaction.LOCK.UPDATE, transaction });
 
-    if (
-      !ticket ||
-      (ticket.triage_status !== TRIAGE_STATUS.PENDING &&
-        ticket.triage_status !== TRIAGE_STATUS.RETRY_WAIT)
-    )
+    if (!ticket) {
+      logger.info(`Ticket ${ticketId} claim skipped because the ticket does not exist`);
       return;
+    }
+
+    logger.info(`Ticket ${ticketId} row locked with status ${ticket.triage_status}`);
+    if (
+      ticket.triage_status !== TRIAGE_STATUS.PENDING &&
+      ticket.triage_status !== TRIAGE_STATUS.RETRY_WAIT
+    ) {
+      logger.info(
+        `Ticket ${ticketId} claim skipped because status ${ticket.triage_status} is not eligible`
+      );
+      return;
+    }
 
     const previousStatus = ticket.triage_status;
 
+    logger.info(
+      `Ticket ${ticketId} claim transition started: ${previousStatus} to ${TRIAGE_STATUS.PROCESSING}`
+    );
     ticket.triage_status = TRIAGE_STATUS.PROCESSING;
     ticket.processing_attempt += 1;
     ticket.processing_started_at = new Date();
     if (previousStatus === TRIAGE_STATUS.RETRY_WAIT) ticket.last_retry_at = new Date();
     processingAttempt = ticket.processing_attempt;
     await ticket.save({ transaction });
+    logger.info(
+      `Ticket ${ticketId} status changed to ${TRIAGE_STATUS.PROCESSING} on attempt ${processingAttempt}`
+    );
 
+    logger.info(`Ticket ${ticketId} processing-started history write started`);
     await TicketStatusHistory.create(
       {
         ticket_id: ticketId,
@@ -49,18 +68,40 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
       },
       { transaction }
     );
+    logger.info(`Ticket ${ticketId} processing-started history recorded`);
   });
+  logger.info(`Ticket ${ticketId} claim transaction completed`);
 
-  if (processingAttempt === undefined) return false;
+  if (processingAttempt === undefined) {
+    logger.info(
+      `Ticket ${ticketId} processing workflow skipped because this delivery did not claim it`
+    );
+    return false;
+  }
 
+  logger.info(`Ticket ${ticketId} reload before triage started for attempt ${processingAttempt}`);
   const ticket = await Ticket.findByPk(ticketId);
-  if (!ticket) return false;
+  if (!ticket) {
+    logger.warn(`Ticket ${ticketId} disappeared after claim; no triage call will be made`);
+    return false;
+  }
+  logger.info(
+    `Ticket ${ticketId} reload completed; beginning triage for attempt ${processingAttempt}`
+  );
 
   try {
     logger.info(`Ticket ${ticketId} triage validation started`);
     const triageResult = await cachedTriage({ subject: ticket.subject, body: ticket.body });
+    logger.info(
+      `Ticket ${ticketId} triage result ready: category ${triageResult.result.category}, priority ${triageResult.result.priority}, source ${triageResult.source}`
+    );
 
+    logger.info(
+      `Ticket ${ticketId} completion transaction started for attempt ${processingAttempt}`
+    );
+    let triagePersisted = false;
     await db.transaction(async (transaction) => {
+      logger.info(`Ticket ${ticketId} completion row lock requested`);
       const currentTicket = await Ticket.findByPk(ticketId, {
         lock: transaction.LOCK.UPDATE,
         transaction,
@@ -70,9 +111,12 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         !currentTicket ||
         currentTicket.processing_attempt !== processingAttempt ||
         currentTicket.triage_status !== TRIAGE_STATUS.PROCESSING
-      )
+      ) {
+        logger.info(`Ticket ${ticketId} completion skipped because its attempt or status changed`);
         return;
+      }
 
+      logger.info(`Ticket ${ticketId} triage result persistence started`);
       await TriageResult.findOrCreate({
         where: { ticket_id: ticketId },
         defaults: {
@@ -84,12 +128,18 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         },
         transaction,
       });
+      logger.info(`Ticket ${ticketId} triage result persistence completed`);
 
+      logger.info(
+        `Ticket ${ticketId} status transition started: ${TRIAGE_STATUS.PROCESSING} to ${TRIAGE_STATUS.TRIAGED}`
+      );
       currentTicket.triage_status = TRIAGE_STATUS.TRIAGED;
       currentTicket.status_reason = TICKET_STATUS_REASON.TRIAGE_COMPLETED;
       currentTicket.completed_at = new Date();
       await currentTicket.save({ transaction });
+      logger.info(`Ticket ${ticketId} status updated to ${TRIAGE_STATUS.TRIAGED}`);
 
+      logger.info(`Ticket ${ticketId} triage-completed history write started`);
       await TicketStatusHistory.create(
         {
           ticket_id: ticketId,
@@ -100,17 +150,32 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         },
         { transaction }
       );
+      logger.info(`Ticket ${ticketId} triage-completed history recorded`);
+      triagePersisted = true;
     });
+    logger.info(`Ticket ${ticketId} completion transaction completed`);
+
+    if (!triagePersisted) {
+      logger.warn(
+        `Ticket ${ticketId} triage result was not persisted because the processing attempt became stale`
+      );
+      return false;
+    }
 
     logger.info(`Ticket ${ticketId} triage completed successfully`);
+    logger.info(`Ticket ${ticketId} duplicate detection started`);
     await detectDuplicate({ ticket, ticketId });
+    logger.info(`Ticket ${ticketId} duplicate detection completed`);
     return false;
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'Provider failure';
     const invalidOutput = reason.startsWith('Invalid model output');
     let shouldRetry = false;
 
+    logger.error(`Ticket ${ticketId} triage attempt failed: ${reason}`);
+    logger.info(`Ticket ${ticketId} failure status transaction started`);
     await db.transaction(async (transaction) => {
+      logger.info(`Ticket ${ticketId} failure row lock requested`);
       const currentTicket = await Ticket.findByPk(ticketId, {
         lock: transaction.LOCK.UPDATE,
         transaction,
@@ -120,11 +185,16 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         !currentTicket ||
         currentTicket.processing_attempt !== processingAttempt ||
         currentTicket.triage_status !== TRIAGE_STATUS.PROCESSING
-      )
+      ) {
+        logger.info(
+          `Ticket ${ticketId} failure update skipped because its attempt or status changed`
+        );
         return;
+      }
 
       const canRetry = !invalidOutput && currentTicket.retry_count < 3;
       shouldRetry = canRetry;
+      const previousStatus = currentTicket.triage_status;
       currentTicket.triage_status = canRetry
         ? TRIAGE_STATUS.RETRY_WAIT
         : TRIAGE_STATUS.MANUAL_REVIEW;
@@ -132,7 +202,13 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
 
       if (canRetry) currentTicket.retry_count += 1;
 
+      logger.info(
+        `Ticket ${ticketId} failure transition started: ${previousStatus} to ${currentTicket.triage_status}; retry_count=${currentTicket.retry_count}`
+      );
       await currentTicket.save({ transaction });
+      logger.info(`Ticket ${ticketId} failure status saved as ${currentTicket.triage_status}`);
+
+      logger.info(`Ticket ${ticketId} failure history write started`);
       await TicketStatusHistory.create(
         {
           ticket_id: ticketId,
@@ -143,9 +219,17 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         },
         { transaction }
       );
+      logger.info(`Ticket ${ticketId} failure history recorded with reason: ${reason}`);
     });
 
-    logger.error(`Ticket ${ticketId} processing failed: ${reason}`);
+    logger.info(`Ticket ${ticketId} failure status transaction completed`);
+    if (shouldRetry) {
+      logger.info(`Ticket ${ticketId} is retryable; requesting RabbitMQ delayed redelivery`);
+    } else {
+      logger.warn(
+        `Ticket ${ticketId} moved to ${TRIAGE_STATUS.MANUAL_REVIEW}; no further retry will be requested`
+      );
+    }
     return shouldRetry;
   }
 };
@@ -159,13 +243,20 @@ const detectDuplicate = async ({
   ticketId: number;
 }): Promise<void> => {
   try {
+    logger.info(`Ticket ${ticketId} embedding generation started for duplicate detection`);
     const vector = await embedText({ subject: ticket.subject, body: ticket.body });
+    logger.info(`Ticket ${ticketId} embedding generated with ${vector.length} dimensions`);
 
-    await TicketEmbedding.findOrCreate({
+    logger.info(`Ticket ${ticketId} embedding persistence started`);
+    const [, embeddingCreated] = await TicketEmbedding.findOrCreate({
       where: { ticket_id: ticketId },
       defaults: { ticket_id: ticketId, embedding_model: EMBEDDING_MODEL, embedding: vector },
     });
+    logger.info(
+      `Ticket ${ticketId} embedding persistence completed: ${embeddingCreated ? 'created' : 'already existed'}`
+    );
 
+    logger.info(`Ticket ${ticketId} duplicate candidate lookup started`);
     const candidates = await Ticket.findAll({
       where: {
         customer_id: ticket.customer_id,
@@ -182,23 +273,46 @@ const detectDuplicate = async ({
       attributes: ['id'],
     });
     const candidateIds = candidates.map((candidate) => Number(candidate.id));
+    logger.info(
+      `Ticket ${ticketId} duplicate candidate lookup found ${candidateIds.length} ticket(s)`
+    );
 
-    if (candidateIds.length === 0) return;
+    if (candidateIds.length === 0) {
+      logger.info(
+        `Ticket ${ticketId} duplicate detection ended because no candidates were available`
+      );
+      return;
+    }
 
+    logger.info(`Ticket ${ticketId} nearest embedding search started`);
     const { cosineDistance } = await import('pgvector/sequelize');
     const closest = await TicketEmbedding.findOne({
       where: { ticket_id: { [Op.in]: candidateIds }, embedding_model: EMBEDDING_MODEL },
       order: [[cosineDistance('embedding', vector, db), 'ASC']],
     });
 
-    if (!closest) return;
+    if (!closest) {
+      logger.info(
+        `Ticket ${ticketId} duplicate detection ended because no stored embeddings matched`
+      );
+      return;
+    }
 
     const similarity = cosineSimilarity(vector, closest.embedding);
+    logger.info(
+      `Ticket ${ticketId} closest candidate is ${closest.ticket_id} with similarity ${similarity.toFixed(4)}`
+    );
     if (similarity >= 0.92) {
+      logger.info(
+        `Ticket ${ticketId} exceeds the duplicate threshold; linking to ticket ${closest.ticket_id}`
+      );
       await Ticket.update(
         { duplicate_of_ticket_id: closest.ticket_id },
         { where: { id: ticketId } }
       );
+      logger.info(`Ticket ${ticketId} linked to duplicate ticket ${closest.ticket_id}`);
+    } else {
+      logger.info(`Ticket ${ticketId} is below the duplicate threshold and remains unlinked`);
     }
   } catch (error) {
     logger.error(`Ticket ${ticketId} duplicate detection failed: ${(error as Error).message}`);
