@@ -8,7 +8,12 @@ import {
   PROMPT_VERSION,
 } from '../config';
 import { TICKET_CATEGORY, TICKET_PRIORITY } from '../modules/tickets/enum';
-import { judgeResultSchema, modelCandidateSchema, resultSchema } from './schemas';
+import {
+  judgeResultSchema,
+  modelCandidateSchema,
+  resultSchema,
+  semanticReuseResultSchema,
+} from './schemas';
 import type {
   GeminiTriageInput,
   TriageCandidate,
@@ -320,7 +325,23 @@ export const cachedTriage = async (input: {
   if (input.findSimilar) {
     try {
       const similarResult = await input.findSimilar();
-      if (similarResult) return { result: similarResult, source: 'semanticReuse' };
+      if (similarResult) {
+        const result = validateResult(similarResult);
+        if ((result.confidence ?? 0) >= 0.85) {
+          logger.info('Verified semantic result is eligible for exact-text cache persistence');
+          await TriageCache.findOrCreate({
+            where: { text_hash: textHash, model_name: MODEL_NAME, prompt_version: PROMPT_VERSION },
+            defaults: {
+              text_hash: textHash,
+              model_name: MODEL_NAME,
+              prompt_version: PROMPT_VERSION,
+              ...result,
+            },
+          });
+          logger.info('Verified semantic result persisted in the exact-text cache');
+        }
+        return { result, source: 'semanticReuse' };
+      }
     } catch (error) {
       logger.warn(
         `Semantic reuse lookup failed; regular triage will proceed: ${(error as Error).message}`
@@ -376,13 +397,11 @@ export const verifySemanticReuse = async ({
       temperature: 0.1,
     },
   });
-  const parsed = JSON.parse(response.text || 'null') as {
-    accepted?: boolean;
-    summary?: string;
-    confidence?: number;
-    evidence?: string[];
-  };
-  if (!parsed?.accepted) return null;
+  const parsedResponse = JSON.parse(response.text || 'null') as unknown;
+  const { error, value: parsed } = semanticReuseResultSchema.validate(parsedResponse);
+  if (error)
+    throw new Error(`Invalid model output: invalid semantic reuse response. ${error.message}`);
+  if (!parsed.accepted) return null;
   const candidate = validateCandidate({
     ticket,
     value: {

@@ -38,3 +38,13 @@ export const judgeResultSchema = Joi.object({
 })
   .required()
   .unknown(false);
+
+/** Shape returned by the semantic reuse verifier. */
+export const semanticReuseResultSchema = Joi.object({
+  accepted: Joi.boolean().required(),
+  summary: Joi.string().min(1).max(500).required(),
+  confidence: Joi.number().min(0).max(1).required(),
+  evidence: Joi.array().items(Joi.string().min(1)).min(1).max(3).required(),
+})
+  .required()
+  .unknown(false);
