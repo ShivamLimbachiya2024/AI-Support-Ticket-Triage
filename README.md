@@ -1,66 +1,158 @@
 # AI Support Ticket Triage
 
-Express, PostgreSQL/pgvector, RabbitMQ, and Gemini support ticket triage. The API accepts a ticket immediately and workers classify it asynchronously.
+An asynchronous support-ticket triage API built with TypeScript, Express, PostgreSQL/pgvector, RabbitMQ, and Google Gemini. Ticket submission returns quickly; a separate worker classifies tickets, records the result, and makes failures visible to support staff.
 
-## Run
+## What the implementation covers
 
-You need Docker Engine with the Docker Compose plugin and internet access for the first run. You do not need Node.js, PostgreSQL, or RabbitMQ installed on the host. Compose downloads missing registry images and builds the application and pgvector-enabled PostgreSQL images.
+| Assignment requirement                   | Implementation                                                                                                                                                                                                                                                         |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fast ticket submission                   | Authenticated API validates the request, saves the ticket and outbox event, then returns `202` with the ticket ID and `pending` status.                                                                                                                                |
+| Category, priority, and summary          | Classifies as billing, technical, account, feedback, or other; assigns low, medium, high, or urgent priority; writes a one-sentence English summary.                                                                                                                   |
+| Reliable model output                    | Validates the response schema and source evidence, then uses a separate model call to judge whether the labels and summary are supported. Invalid candidates get up to three correction attempts.                                                                      |
+| Manual review                            | Low-confidence results, invalid output, and exhausted or non-retryable failures are visible in `manual_review` with a reason. Gemini connection failures remain visible while bounded automatic retries run; support can manually retry once that budget is exhausted. |
+| Background work and retry safety         | RabbitMQ delayed retries, a transactional database outbox, row-locked worker claims, attempt fencing, and stale-work recovery protect ticket processing across failures and duplicate deliveries.                                                                      |
+| Ticket search and history                | Support can list and filter tickets with pagination. Status changes and retry counts are recorded in ticket history.                                                                                                                                                   |
+| Prompt-aware caching                     | A verified exact-text result cache is keyed by ticket text, model, and prompt/validation version.                                                                                                                                                                      |
+| Similarity reuse and duplicate detection | Same-customer embeddings can support verified result reuse and link likely duplicate tickets. The two paths are described below.                                                                                                                                       |
 
-1. Copy `.env.example` to `.env` and set the required values. Set `DATABASE_URL` to a PostgreSQL connection string using host `postgres` for Compose, and set a long `JWT_SECRET` and a changed support password.
-2. Run `docker compose up -d --build`. Compose builds the application and PostgreSQL images, and downloads RabbitMQ if its image is missing locally.
-3. The API runs on PORT. Compose starts one worker consuming the quorum `ticket_processing` queue. RabbitMQ applies native delayed retry when the worker returns a retryable message. The API and worker also relay committed ticket events from the database outbox. The support account is seeded from SUPPORT_EMAIL and SUPPORT_PASSWORD.
+For a code-linked walkthrough of the request, worker, retry, and read flows, see [docs/ticket-processing-flow.md](docs/ticket-processing-flow.md).
 
-RabbitMQ queue types and declaration arguments are immutable. Before upgrading an existing `ticket_processing` queue, let ready, unacknowledged, and delayed messages finish or recover them deliberately, then delete the empty queue so this version can recreate it with the current delayed-retry settings.
+## Request and processing flow
 
-When connecting to an externally managed broker, use RabbitMQ 4.3 or later. Compose uses RabbitMQ 4.3.7.
+```mermaid
+flowchart LR
+    C[Customer or support agent] -->|POST /api/tickets| A[Express API]
+    A -->|ticket, history, outbox event in one transaction| DB[(PostgreSQL)]
+    A -->|202: ticket ID and pending status| C
+    DB --> O[Outbox relay]
+    O -->|publisher-confirmed event| Q[RabbitMQ ticket_processing]
+    Q --> W[Processing worker]
+    W -->|lock row, claim attempt| DB
+    W --> X{Resolve triage}
+    X -->|exact cache hit| DB
+    X -->|similarity reuse or model inference| G[Gemini]
+    X -->|validated result and history| DB
+    W -->|bounded transient retry| Q
+    W -->|needs human attention| M[Support manual review]
+```
 
-Compose runs a single RabbitMQ node. Its quorum queue is durable on the mounted volume but does not provide node-level failover; use a multi-node RabbitMQ cluster for that.
+The API returns after its database transaction commits; the outbox relay publishes the work event independently. RabbitMQ uses a durable quorum queue. Workers claim tickets in short transactions, release the row lock before model calls, and only persist a result if the stored processing attempt still matches the worker's attempt.
 
-For a no-key run, set `MODEL_PROVIDER=fake`, `MODEL_NAME=fake_v1`, and `EMBEDDING_MODEL=fake_embedding_v1`. For a lower-cost real Gemini run, set `MODEL_PROVIDER=gemini`, `MODEL_NAME=gemini-3.5-flash-lite`, `EMBEDDING_MODEL=gemini-embedding-2`, and `GEMINI_API_KEY`. `GEMINI_API_KEY` is required only in Gemini mode. Confirm the model has a nonzero quota for your project in Google AI Studio. When running the app outside Compose, set the host in `DATABASE_URL` to the address where PostgreSQL is reachable, such as `localhost`.
+### Ticket states
 
-Run npm test and npm run build. Migrations use Sequelize CLI and the pgvector extension is bootstrapped by the PostgreSQL image. Compose builds the PostgreSQL image as `postgres-pgvector:16` from the `postgres:16` and `pgvector/pgvector:0.8.1-pg16` base images; it downloads `rabbitmq:4.3.7-management` when it is missing locally.
+| State           | Meaning                                                                                                                                                                        |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pending`       | Submitted and waiting for processing, or requeued after stale-work recovery.                                                                                                   |
+| `processing`    | A worker has claimed the current attempt.                                                                                                                                      |
+| `retry_wait`    | A retryable transient or rate-limit failure is waiting for RabbitMQ delayed redelivery.                                                                                        |
+| `manual_review` | Support attention is needed. A Gemini connection retry may also use this state while an automatic retry is scheduled; `canRetryClassification` remains false during that wait. |
+| `triaged`       | A validated result was saved with confidence of at least 0.85.                                                                                                                 |
+
+### Classification quality and safety
+
+Gemini receives ticket fields as untrusted data and is instructed to ignore directions embedded in the ticket. Candidate output must match the allowed category and priority values, include one to three exact evidence quotes from the ticket, and contain exactly one English summary sentence. A separate judge checks the proposed labels, evidence, confidence, and summary against the source ticket. Only checked results are written to triage results or cache.
+
+Confidence below 0.85 is routed to manual review. Confidence is retained internally for workflow decisions and is not presented as a model guarantee. These checks reduce unsupported classifications and prompt-injection risk; human evaluation is still needed to assess quality for a particular support domain.
+
+### Retry, outbox, and worker recovery
+
+- Ticket creation, support retry requests, and stale-ticket recovery write their processing event to `ticket_processing_outbox` in the same PostgreSQL transaction as the associated ticket change.
+- The outbox migration also creates events for tickets that were already `pending`, so existing queued work can be delivered after an upgrade.
+- The API and worker relay committed outbox events to RabbitMQ and remove an event only after a publisher confirmation. A crash around confirmation can result in a duplicate delivery; the worker's status and attempt checks make that delivery safe to acknowledge.
+- Each Gemini classification request has a 30-second HTTP timeout and up to three SDK attempts. Recognized transient HTTP failures (408, 429, 500, 502, 503, 504) and connection/time-out failures can then use up to three bounded RabbitMQ delayed retries. These are separate retry layers.
+- Scheduled connection retries are visible to support in `manual_review`; support retry is enabled only after the automatic retry budget is exhausted. Before accepting a support retry, the API checks Gemini availability with a 10-second request deadline, then commits the status, history, and outbox event together.
+- Invalid output, low confidence, and permanent or unclassified failures do not enter the connection retry path. They retain a status reason so support can understand why the ticket needs review.
+- Worker claims and completion/failure updates use row locks and a monotonically increasing `processing_attempt`. A late worker cannot overwrite a newer attempt.
+- The worker scans every 10 minutes for tickets processing longer than 35 minutes, then returns abandoned work to `pending` through the outbox. Graceful shutdown drains active work before closing RabbitMQ and PostgreSQL.
+
+## Caching and similarity
+
+### Prompt-versioned exact-result cache
+
+After an exact-text cache miss, the application classifies the ticket and stores only a validated result whose confidence is at least 0.85. The cache key combines:
+
+- SHA-256 of the exact subject and body text
+- Configured model name
+- Effective prompt version, which also includes the validation-pipeline revision
+
+A cache hit avoids another classification call and is schema-validated before use. Changing prompt instructions or the validation pipeline changes the effective version, preventing reuse of results from an older classification policy. This is application-level result caching.
+
+### Similarity-based verified reuse
+
+If there is no exact cache hit, the worker can search previously triaged tickets from the same customer using 1536-dimensional embeddings and a starting cosine-similarity threshold of 0.92. A candidate is eligible only when its stored result uses the same model and prompt version and has confidence of at least 0.85.
+
+Similarity alone does not copy a classification. Gemini checks the candidate category and priority against the new ticket and generates a fresh summary for that ticket. If verification fails, normal triage runs. A successful high-confidence reuse is saved under the new ticket's exact-text cache key. Its result source is recorded as `semanticReuse`.
+
+### Duplicate linking
+
+Duplicate linking is a separate post-classification step. The worker compares a ticket embedding with same-customer tickets in pending, processing, retry-wait, or triaged states and links the closest ticket when similarity is at least 0.92. This records a possible relationship; it does not change the new ticket's triage result.
+
+The threshold is an initial operating value, not a calibrated accuracy guarantee. Evaluate it on human-labeled ticket pairs before changing it. See [the evaluation guidance](docs/ticket-processing-flow.md) for the expected evaluation fields and command.
 
 ## API
 
-Every API response uses the shared envelope `{ data, message, toast, response_type }`. Successful responses use `response_type: "success"`; error responses use `response_type: "error"`. HTTP status codes continue to indicate the result.
+All routes use the response envelope `{ data, message, toast, response_type }`. HTTP status codes indicate success or failure; `response_type` is `success` or `error`.
 
-- POST /api/auth/register: first_name, last_name, email, optional phone, password. New accounts are customers.
-- POST /api/auth/login: email, password. Returns an HTTP-only cookie.
-- POST /api/tickets: subject, body, customer_email. Customer submissions must use the authenticated account email; support users may submit a ticket for another email. The `data` value contains the ticket ID and `triage_status`.
-- GET /api/tickets/:id returns status to the owning customer. Support also sees the ticket, triage result, and `canRetryClassification` inside `data`.
-- GET /api/tickets?status=&category=&priority=&page=1&limit=20 lists tickets for support inside `data` and includes `canRetryClassification` on each item.
-- POST /api/tickets/:id/retry-classification takes no request body. Support retries a Gemini connection failure after its automatic retry budget is exhausted. The `data` value contains the ticket ID and pending status after the retry event is committed to the database outbox. Scheduled automatic retries are ineligible for manual retry. The API returns `409` if the ticket is no longer eligible and `503` if Gemini is unavailable.
+- `POST /api/auth/register` — create a customer account.
+- `POST /api/auth/login` — authenticate and receive an HTTP-only cookie.
+- `POST /api/tickets` — submit `subject`, `body`, and `customer_email`; returns `202` with the new ticket ID and status.
+- `GET /api/tickets/:id` — customers see their ticket status; support can see the ticket, result, and retry eligibility.
+- `GET /api/tickets?status=&category=&priority=&page=1&limit=20` — support list with filters and pagination.
+- `POST /api/tickets/:id/retry-classification` — support-only retry for an eligible exhausted Gemini connection failure. It accepts an empty body; unavailable Gemini returns `503`, and an ineligible ticket returns `409`.
 
-## Design
+Request bodies and query parameters are validated with Joi. Customer access is scoped to the authenticated account; support routes expose additional triage details.
 
-Gemini receives the ticket as JSON data under a system instruction that says ticket content is untrusted and must not change the task. The response schema restricts category and priority to the supported values and asks for a summary plus short source quotes. Joi checks the exact shape and one-sentence summary; the worker confirms each quote appears verbatim in the ticket. A second, short Gemini call acts as a judge: it checks that the category, priority, evidence, and summary are relevant and supported by the source. The judge reuses the configured model, which keeps deployment simple but can still share the generator's blind spots. Category, priority, summary, and internal confidence are persisted only after checks pass; rejected outputs are never cached or written to triage results. Prompt injection defenses reduce risk but cannot guarantee model correctness. After three invalid or rejected candidates, the ticket is marked for manual review.
+## Run locally with Docker Compose
 
-A processing worker claims a pending or retry-waiting ticket in a short row-lock transaction, records processing status and attempt number, then releases the lock before calling the provider. A scheduled Gemini connection retry remains visible as `manual_review` while RabbitMQ delays it; the worker claims only that marked state under the same row lock and changes it to `processing` before inference. This keeps support retries disabled during the delay and makes duplicate deliveries skip once a worker has claimed the ticket. Completion is fenced by the attempt number. Each Gemini HTTP request has a 30-second timeout and up to three SDK attempts for errors eligible under the SDK policy. A structurally or semantically invalid result gets up to three local generate-and-judge attempts, then the ticket is marked for manual review. Provider failures remaining after SDK retries are classified before queue retry or manual review. Retryable HTTP failures and recognized timeouts or transient transport failures get up to three delayed application retries. The processing slot is released while RabbitMQ holds the message. Retry counts and status reasons remain in PostgreSQL. Messages are persistent and consumers acknowledge after database changes.
+Requirements: Docker Engine, the Docker Compose plugin, and internet access for the initial image builds and downloads. Host-installed Node.js, PostgreSQL, or RabbitMQ are not required.
 
-Ticket creation, support retries, and stale-ticket recovery write a ticket event to `ticket_processing_outbox` in the same database transaction as the ticket update. The API and worker relay confirmed messages from that table and remove each event after RabbitMQ confirms it. A restart between broker confirmation and database deletion can cause a duplicate message; the worker’s ticket status and attempt checks make those deliveries safe to acknowledge.
+1. Copy `.env.example` to `.env`. Set the required database, RabbitMQ, JWT, and support-account values.
+2. For a no-key local run, keep `MODEL_PROVIDER=fake`, `MODEL_NAME=fake_v1`, and `EMBEDDING_MODEL=fake_embedding_v1`.
+3. Start the stack:
 
-The outbox migration also queues existing `pending` tickets once, so an upgrade recovers pending work from before the outbox was introduced.
+   ```sh
+   docker compose up -d --build
+   ```
 
-Cache identity includes the exact subject/body text hash, model name, and prompt version. The application adds its validation-pipeline revision to the configured `PROMPT_VERSION`, so this rollout cannot reuse results produced before evidence checks and judging; bump the configured version when changing prompt instructions. Duplicate detection uses `gemini-embedding-2` with the symmetric `sentence similarity` task prefix and 1536 dimensions. This dimension is Google-recommended and fits pgvector's 2000-dimension HNSW index limit. The initial create-table migration now creates the matching 1536-dimensional column. A database that already applied the earlier 32-dimensional migration has an older schema; Sequelize will not rerun an edited migration file. This is a schema version issue, not malformed or incompatible ticket data. For a disposable local database, recreate it before running migrations. For a database whose data must be kept, use a forward migration to replace the old embedding column/index and regenerate those derived embeddings; until then, the app's 1536-dimensional embedding operations are incompatible with its 32-dimensional column. The configured 0.92 similarity threshold should be recalibrated against labeled ticket pairs before changing it. Embeddings rank similar open tickets from the same customer.
+The API listens on the configured `PORT` (8080 in the example). Compose applies database migrations, seeds the support account from `SUPPORT_EMAIL` and `SUPPORT_PASSWORD`, and starts one processing worker.
 
-At 10,000 tickets/hour, provider throughput and rate limits, queue depth, and database connections become the first constraints. At one million/day, scale worker replicas and connection pooling, partition or archive old tickets and history, batch queue publishing, and enforce provider concurrency and cost budgets.
+To follow API and worker logs in the terminal:
 
-## Accuracy and retry policy
+```sh
+docker compose logs -f api processing_worker
+```
 
-The classifier uses the JavaScript SDK’s numeric `ApiError.status` for HTTP errors. HTTP 408, 429, 500, 502, 503, and 504 retain the initial triage retry budget. HTTP 402 indicates a payment problem, 401 and 403 indicate authorization or configuration problems, and 400, 404, and 422 indicate a rejected request. A 429 can represent a rate or quota limit. The SDK does not expose structured quota details or response headers on `ApiError`, so the worker keeps its bounded policy for all 429 responses. [Google Gemini troubleshooting](https://aistudio.google.com/docs/troubleshooting) · [JavaScript SDK ApiError](https://googleapis.github.io/js-genai/release_docs/classes/errors.ApiError.html)
+Pino logs include the request method, path, client IP, response status, and duration. Worker messages include ticket IDs and processing outcomes.
 
-A recognized transport failure, such as `ECONNRESET`, `ETIMEDOUT`, or a documented Gemini SDK timeout or connection error, receives the same bounded three delayed retries as retryable HTTP errors after the SDK's immediate attempts finish. While a connection retry is scheduled, the ticket remains `manual_review` with reason **Gemini connection retry scheduled** and `canRetryClassification: false`. The worker changes it to `processing` under a row lock when the delayed delivery arrives. After the retry budget is exhausted, the reason becomes **Gemini connection failed** and support can retry it manually. Invalid model output, low confidence, TLS/configuration errors, explicit user aborts, and unclassified failures do not receive automatic connection retries. The support endpoint makes one authenticated HTTPS generation request with a five-second deadline and a fixed prompt containing no ticket data. [JavaScript SDK v3.6.1 error wrappers](https://github.com/googleapis/js-genai/blob/v3.6.1/src/gaos/lib/compat-errors.ts) · [SDK timeout and connection errors](https://github.com/googleapis/js-genai/blob/v3.6.1/src/gaos/models/errors/http-client-errors.ts)
+For a real Gemini run, set `MODEL_PROVIDER=gemini`, `MODEL_NAME=gemini-3.5-flash-lite`, `EMBEDDING_MODEL=gemini-embedding-2`, and `GEMINI_API_KEY`. Confirm the selected models have quota for the Google AI Studio project. `GEMINI_API_KEY` is required in Gemini mode.
 
-The retry endpoint commits the pending status, agent history, and outbox event together. RabbitMQ availability does not affect that database commit; the relay keeps the event until a confirmed publish succeeds. The worker claims pending tickets under a row lock and increments the database attempt number. Duplicate deliveries see the updated status and are acknowledged without starting another classification. On shutdown, the application stops accepting HTTP requests, stops the outbox relay, cancels the worker consumer, waits for active work, then closes RabbitMQ and PostgreSQL. Stale processing is recovered on the worker’s existing scan.
+Compose uses RabbitMQ 4.3.7 and a single broker node. The quorum queue is durable on its mounted volume, but a single node does not provide node-level failover; use a multi-node cluster for that. Queue type and declaration arguments are immutable. Before upgrading an existing `ticket_processing` queue, let ready, unacknowledged, and delayed messages finish or recover them deliberately, then recreate the empty queue with the new settings.
 
-Apply the migration and deploy all updated workers before the API version that exposes support retries. For the retry integration suite, use dedicated PostgreSQL and RabbitMQ instances. Prepare the database with pgvector and the repository migrations, and set the application environment for those instances with `MODEL_PROVIDER=gemini` and a dummy `GEMINI_API_KEY`. The suite simulates Gemini at the SDK’s fetch boundary and deletes the processing queue in the dedicated broker.
+### Existing database schema note
+
+The baseline migration creates a 1536-dimensional embedding column to match the configured embedding model and pgvector index. If a local database already applied an earlier 32-dimensional migration, editing that migration file does not update the existing schema. Use a forward migration to replace the column and index and regenerate derived embeddings, or recreate a disposable local database before migrating.
+
+## Test and build
+
+```sh
+npm test
+npm run build
+```
+
+The retry integration suite uses dedicated PostgreSQL and RabbitMQ instances with the repository migrations applied. It simulates Gemini at the SDK fetch boundary and deletes the `ticket_processing` queue, so do not point it at shared or production infrastructure.
 
 ```sh
 node --require ts-node/register --test src/modules/tickets/__tests__/classificationRetry.integration.test.ts
 ```
 
-Candidate and judge prompts use explicit priority rules and require an English one-sentence summary even for tickets written in another language. Results below 0.85 confidence need manual review and are not cached. Confidence remains internal.
+The evaluation utility compares predictions to human labels; the model judge is not ground truth. Supply a JSON array with `id`, `expectedCategory`, `expectedPriority`, `predictedCategory`, `predictedPriority`, `triageStatus`, `source`, and `englishSummaryValid`:
 
-Exact-text cache hits remain automatic. Embedding-based reuse checks same-customer tickets above a 0.92 cosine similarity starting threshold, aligned with duplicate detection. This is an operating starting point, not a calibrated accuracy guarantee: evaluate it on human-labeled ticket pairs and adjust based on classification errors and reuse coverage. The model verifies the prior category and priority in one call and generates a fresh summary; failed verification falls back to full triage. Similarity alone never copies a prior summary.
+```sh
+npx ts-node src/rabbitmq/evaluation.ts path/to/labeled-results.json
+```
 
-To evaluate, collect a representative JSON array of human-labeled tickets with `id`, `expectedCategory`, `expectedPriority`, `predictedCategory`, `predictedPriority`, `triageStatus`, `source`, and `englishSummaryValid`. Include all priority levels, languages, ambiguous tickets, injection attempts, and near duplicates. Run `npx ts-node src/rabbitmq/evaluation.ts path/to/labeled-results.json`. Review urgent misses and semantic reuse errors when adjusting the similarity threshold. These metrics use human labels; the model judge is not ground truth.
+## Operational considerations and scope
+
+Provider throughput, model quota, queue depth, and database connections are the first scaling constraints around 10,000 tickets per hour. At larger daily volumes, scale worker replicas and database connection pooling, archive or partition old tickets and history, batch queue publishing, and set provider concurrency and cost budgets.
+
+Implemented optional assignment extensions include prompt-injection defenses, embedding-based duplicate handling, Docker Compose setup, and test/evaluation tooling. Suggested-reply generation, model usage reporting, and API-key rate limiting are outside the current implementation.

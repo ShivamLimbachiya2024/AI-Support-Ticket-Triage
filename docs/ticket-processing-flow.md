@@ -96,7 +96,7 @@ The [processing handler](../src/rabbitmq/handlers/ticketProcessing.handler.ts) s
 | `processing` → `retry_wait`    | Retryable HTTP failure while `retry_count < 3`. Reason identifies the provider failure.                                                                                                      |
 | `processing` → `manual_review` | Connection failure while `retry_count < 3` stays in manual review with reason `Gemini connection retry scheduled`; the worker requests delayed redelivery and manual retry remains disabled. |
 | `processing` → `manual_review` | Non-retryable failure or exhausted retries. A connection failure uses reason `Gemini connection failed`, enabling support retry.                                                             |
-| `processing` → `pending`       | Stale recovery finds the ticket still processing and older than 30 minutes. Reason is `Previous processing attempt timed out`.                                                               |
+| `processing` → `pending`       | Stale recovery finds the ticket still processing and older than 35 minutes. Reason is `Previous processing attempt timed out`.                                                               |
 
 ### How retries are decided
 
@@ -108,7 +108,7 @@ The [processing handler](../src/rabbitmq/handlers/ticketProcessing.handler.ts) s
 
 ```mermaid
 flowchart LR
-    A["recoverStaleTickets<br/>Run on worker startup and every 10 minutes"] --> B["Find processing rows with processing_started_at<br/>older than 30 minutes"]
+    A["recoverStaleTickets<br/>Run on worker startup and every 10 minutes"] --> B["Find processing rows with processing_started_at<br/>older than 35 minutes"]
     B --> C{"Lock each row and recheck that it is still stale"}
     C -- No --> D["Skip row"]
     C -- Yes --> E["Set pending and record timeout history"]
