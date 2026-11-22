@@ -4,9 +4,13 @@ import db from '../../../sequelize/models';
 import Ticket from '../../../sequelize/models/tickets.modal';
 import TicketProcessingOutbox from '../../../sequelize/models/ticket_processing_outbox.modal';
 import TicketStatusHistory from '../../../sequelize/models/ticket_status_history.modal';
+import {
+  maxTicketProcessingDurationMs,
+  staleTicketRecoveryGraceMs,
+} from '../../../rabbitmq/processingTiming';
 import { TRIAGE_STATUS, TICKET_STATUS_REASON } from '../enum';
 
-const staleTicketTimeoutMs = 30 * 60 * 1000;
+const staleTicketTimeoutMs = maxTicketProcessingDurationMs + staleTicketRecoveryGraceMs;
 
 /** Requeue processing tickets abandoned by a crashed worker. */
 export const recoverStaleTickets = async (): Promise<void> => {

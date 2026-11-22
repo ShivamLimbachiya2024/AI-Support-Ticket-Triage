@@ -7,7 +7,7 @@ jest.mock('../../config', () => ({
 }));
 
 import _ from 'lodash';
-import { GEMINI_HTTP_OPTIONS, runGeminiTriage } from '../triage';
+import { createGeminiHttpOptions, GEMINI_HTTP_OPTIONS, runGeminiTriage } from '../triage';
 import { TICKET_CATEGORY, TICKET_PRIORITY } from '../../modules/tickets/enum';
 
 test('retries rejected Gemini output, isolates ticket data, and configures SDK transport retries', async () => {
@@ -110,4 +110,23 @@ test('preserves a Gemini transport failure separately from invalid classificatio
     })
   ).rejects.toMatchObject({ kind: 'connection' });
   expect(generateContent).toHaveBeenCalledTimes(1);
+});
+
+test('aborts Gemini fetches when the ticket attempt deadline expires', async () => {
+  const attemptController = new AbortController();
+  const sdkTimeoutController = new AbortController();
+  const fetchMock = jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'));
+  const httpOptions = createGeminiHttpOptions({ signal: attemptController.signal });
+
+  try {
+    await httpOptions.fetch?.('https://example.test', { signal: sdkTimeoutController.signal });
+    const requestSignal = fetchMock.mock.calls[0][1]?.signal;
+
+    expect(requestSignal).toBeInstanceOf(AbortSignal);
+    expect(requestSignal?.aborted).toBe(false);
+    attemptController.abort();
+    expect(requestSignal?.aborted).toBe(true);
+  } finally {
+    fetchMock.mockRestore();
+  }
 });

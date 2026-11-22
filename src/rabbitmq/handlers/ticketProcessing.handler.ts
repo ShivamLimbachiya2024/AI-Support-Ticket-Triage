@@ -14,6 +14,7 @@ import {
 import { logger } from '../../logger';
 import { GeminiRequestError } from '../../utils/retry';
 import { GEMINI_FAILURE_KIND } from '../enums';
+import { maxTicketProcessingDurationMs } from '../processingTiming';
 import {
   cachedTriage,
   embedText,
@@ -46,6 +47,7 @@ const maxDelayedRetries = 3;
 export const processTicket = async ({ ticketId }: { ticketId: number }): Promise<boolean> => {
   logger.info(`Ticket ${ticketId} processing workflow started`);
   let processingAttempt: number | undefined;
+  let processingStartedAt: Date | undefined;
 
   logger.info(`Ticket ${ticketId} claim transaction started`);
   await db.transaction(async (transaction) => {
@@ -78,7 +80,8 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
     );
     ticket.triage_status = TRIAGE_STATUS.PROCESSING;
     ticket.processing_attempt += 1;
-    ticket.processing_started_at = new Date();
+    processingStartedAt = new Date();
+    ticket.processing_started_at = processingStartedAt;
     const reason = ticketProcessingReasonByPreviousStatus[previousStatus];
     ticket.status_reason = reason;
     ticket.triage_failure_code = null;
@@ -134,13 +137,30 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
     `Ticket ${ticketId} reload completed; beginning triage for attempt ${processingAttempt}`
   );
 
+  const attemptAbortController = new AbortController();
+  const elapsedAttemptMs = Date.now() - (processingStartedAt?.getTime() ?? Date.now());
+  const remainingAttemptMs = Math.max(0, maxTicketProcessingDurationMs - elapsedAttemptMs);
+  const abortAttempt = () => {
+    logger.warn(`Ticket ${ticketId} attempt ${processingAttempt} reached its 30-minute limit`);
+    attemptAbortController.abort();
+  };
+  const attemptTimeout =
+    remainingAttemptMs > 0 ? setTimeout(abortAttempt, remainingAttemptMs) : null;
+  if (remainingAttemptMs === 0) abortAttempt();
+
   try {
     logger.info(`Ticket ${ticketId} triage validation started`);
     const triageResult = await cachedTriage({
       subject: ticket.subject,
       body: ticket.body,
-      findSimilar: () => findSemanticTriage({ ticket, ticketId }),
+      signal: attemptAbortController.signal,
+      findSimilar: (signal) => findSemanticTriage({ ticket, ticketId, signal }),
     });
+    if (attemptAbortController.signal.aborted) {
+      throw new GeminiRequestError(
+        new DOMException('Ticket processing deadline exceeded', 'AbortError')
+      );
+    }
     logger.info(
       `Ticket ${ticketId} triage result ready: category ${triageResult.result.category}, priority ${triageResult.result.priority}, source ${triageResult.source}`
     );
@@ -247,6 +267,7 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
     let kind = GEMINI_FAILURE_KIND.UNCLASSIFIED;
     if (error instanceof GeminiRequestError) kind = error.kind;
     let reason = providerFailureReasons[kind];
+    if (attemptAbortController.signal.aborted) reason = TICKET_STATUS_REASON.PROCESSING_TIMEOUT;
     if (invalidOutput) reason = TICKET_STATUS_REASON.INVALID_CLASSIFICATION;
     let failureCode: TICKET_TRIAGE_FAILURE_CODE | null = null;
     if (invalidOutput) failureCode = TICKET_TRIAGE_FAILURE_CODE.INVALID_CLASSIFICATION;
@@ -344,6 +365,8 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
       );
     }
     return shouldRetry;
+  } finally {
+    if (attemptTimeout) clearTimeout(attemptTimeout);
   }
 };
 
@@ -351,11 +374,13 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
 export const findSemanticTriage = async ({
   ticket,
   ticketId,
+  signal,
 }: {
   ticket: Ticket;
   ticketId: number;
+  signal?: AbortSignal;
 }): Promise<import('../types').TriageOutput | null> => {
-  const vector = await embedText({ subject: ticket.subject, body: ticket.body });
+  const vector = await embedText({ subject: ticket.subject, body: ticket.body, signal });
   const candidates = await Ticket.findAll({
     where: {
       customer_id: ticket.customer_id,
@@ -391,6 +416,7 @@ export const findSemanticTriage = async ({
     ticket: { subject: ticket.subject, body: ticket.body },
     category: previous.category as import('../../modules/tickets/enum').TICKET_CATEGORY,
     priority: previous.priority as import('../../modules/tickets/enum').TICKET_PRIORITY,
+    signal,
   });
 };
 

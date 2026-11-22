@@ -1,12 +1,11 @@
 import type { ConfirmChannel, ConsumeMessage } from 'amqplib';
 import { logger } from '../../logger';
 import { recoverStaleTickets } from '../../modules/tickets/helper/staleTicketRecovery.helper';
+import { staleTicketRecoveryIntervalMs } from '../processingTiming';
 import { QueueAction, QueueName } from '../enums';
 import type { QueueHandler, QueuePayload } from '../types';
 import { queuePayloadSchema } from '../schemas';
 import { processTicket } from '../handlers/ticketProcessing.handler';
-
-const staleTicketRecoveryIntervalMs = 10 * 60 * 1000;
 
 const queueHandlers: Record<QueueName, Partial<Record<QueueAction, QueueHandler>>> = {
   [QueueName.TICKET_PROCESSING]: {

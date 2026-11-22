@@ -117,3 +117,29 @@ test('skips duplicate delivery while another worker owns the processing state', 
   expect(cachedTriage).not.toHaveBeenCalled();
   expect(ticket.processing_attempt).toBe(2);
 });
+
+test('aborts and stops retrying a ticket attempt when its processing deadline expires', async () => {
+  jest.useFakeTimers();
+  (cachedTriage as jest.Mock).mockImplementation(
+    ({ signal }: { signal: AbortSignal }) =>
+      new Promise((resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => reject(new GeminiRequestError({ cause: { name: 'AbortError' } })),
+          { once: true }
+        );
+      })
+  );
+
+  try {
+    const processing = processTicket(retryInput);
+    await jest.advanceTimersByTimeAsync(30 * 60 * 1000);
+
+    await expect(processing).resolves.toBe(false);
+    expect(ticket.triage_status).toBe(TRIAGE_STATUS.MANUAL_REVIEW);
+    expect(ticket.status_reason).toBe(TICKET_STATUS_REASON.PROCESSING_TIMEOUT);
+    expect(ticket.retry_count).toBe(0);
+  } finally {
+    jest.useRealTimers();
+  }
+});

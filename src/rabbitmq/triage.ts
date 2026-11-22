@@ -25,7 +25,9 @@ import type {
 import TriageCache from '../sequelize/models/triage_cache.modal';
 import { logger } from '../logger';
 import { GeminiRequestError } from '../utils/retry';
-import type { GenerateContentParameters } from '@google/genai' with { 'resolution-mode': 'import' };
+import type { Fetch, GenerateContentParameters } from '@google/genai' with {
+  'resolution-mode': 'import',
+};
 export const EMBEDDING_DIMENSION = 1536;
 export const SEMANTIC_REUSE_THRESHOLD = 0.92;
 const MAX_OUTPUT_ATTEMPTS = 3;
@@ -45,6 +47,20 @@ export const GEMINI_HTTP_OPTIONS = {
     expBase: 2,
     jitter: 0.5,
   },
+};
+export const createGeminiHttpOptions = ({
+  signal,
+}: {
+  signal?: AbortSignal;
+} = {}): typeof GEMINI_HTTP_OPTIONS & { fetch?: Fetch } => {
+  if (!signal) return { ...GEMINI_HTTP_OPTIONS };
+
+  const fetchWithAttemptSignal: Fetch = (input, init) => {
+    const requestSignal = init?.signal ? AbortSignal.any([signal, init.signal]) : signal;
+    return globalThis.fetch(input, { ...init, signal: requestSignal });
+  };
+
+  return { ...GEMINI_HTTP_OPTIONS, fetch: fetchWithAttemptSignal };
 };
 export class InvalidClassificationError extends Error {}
 
@@ -293,7 +309,9 @@ export const runGeminiTriage = async ({
     },
   });
 };
-export const triageText = async (input: TriageTicket): Promise<TriageOutput> => {
+export const triageText = async (
+  input: TriageTicket & { signal?: AbortSignal }
+): Promise<TriageOutput> => {
   logger.info(`Ticket triage provider selected: ${MODEL_PROVIDER}`);
   if (MODEL_PROVIDER === 'fake') {
     logger.info('Generating deterministic fake triage result');
@@ -311,13 +329,17 @@ export const triageText = async (input: TriageTicket): Promise<TriageOutput> => 
   const { GoogleGenAI, Type } = await import('@google/genai');
   const ai = new GoogleGenAI({
     ...geminiClientOptions,
-    httpOptions: { ...GEMINI_HTTP_OPTIONS },
+    httpOptions: createGeminiHttpOptions({ signal: input.signal }),
   });
   logger.info(`Gemini triage client initialized for model ${MODEL_NAME}`);
   logger.info('Gemini verified triage workflow started');
   return runGeminiTriage({ input, ai, type: Type });
 };
-export const embedText = async (input: { subject: string; body: string }): Promise<number[]> => {
+export const embedText = async (input: {
+  subject: string;
+  body: string;
+  signal?: AbortSignal;
+}): Promise<number[]> => {
   const content = formatEmbeddingText(input);
   logger.info(`Embedding generation started with provider ${MODEL_PROVIDER}`);
   if (MODEL_PROVIDER === 'fake') {
@@ -336,7 +358,10 @@ export const embedText = async (input: { subject: string; body: string }): Promi
 
   logger.info(`Initializing Gemini embedding client for model ${EMBEDDING_MODEL}`);
   const { GoogleGenAI } = await import('@google/genai');
-  const ai = new GoogleGenAI({ ...geminiClientOptions, httpOptions: { ...GEMINI_HTTP_OPTIONS } });
+  const ai = new GoogleGenAI({
+    ...geminiClientOptions,
+    httpOptions: createGeminiHttpOptions({ signal: input.signal }),
+  });
   logger.info(`Gemini embedding client initialized for model ${EMBEDDING_MODEL}`);
   logger.info(`Gemini embedding request started with output dimension ${EMBEDDING_DIMENSION}`);
   const response = await ai.models.embedContent({
@@ -358,7 +383,8 @@ export const embedText = async (input: { subject: string; body: string }): Promi
 export const cachedTriage = async (input: {
   subject: string;
   body: string;
-  findSimilar?: () => Promise<TriageOutput | null>;
+  signal?: AbortSignal;
+  findSimilar?: (signal?: AbortSignal) => Promise<TriageOutput | null>;
 }): Promise<{ result: TriageOutput; source: string }> => {
   logger.info(`Triage cache lookup started for model ${MODEL_NAME} and prompt ${PROMPT_VERSION}`);
   const textHash = crypto
@@ -386,7 +412,7 @@ export const cachedTriage = async (input: {
   logger.info(`Triage cache miss for model ${MODEL_NAME}; model inference will start`);
   if (input.findSimilar) {
     try {
-      const similarResult = await input.findSimilar();
+      const similarResult = await input.findSimilar(input.signal);
       if (similarResult) {
         const result = validateResult(similarResult);
         if ((result.confidence ?? 0) >= 0.85) {
@@ -410,7 +436,7 @@ export const cachedTriage = async (input: {
       );
     }
   }
-  const result = await triageText(input);
+  const result = await triageText({ ...input, signal: input.signal });
   logger.info('Triage model inference completed; cache persistence started');
   if ((result.confidence ?? 0) >= 0.85)
     await TriageCache.findOrCreate({
@@ -431,14 +457,19 @@ export const verifySemanticReuse = async ({
   ticket,
   category,
   priority,
+  signal,
 }: {
   ticket: TriageTicket;
   category: TICKET_CATEGORY;
   priority: TICKET_PRIORITY;
+  signal?: AbortSignal;
 }): Promise<TriageOutput | null> => {
   if (MODEL_PROVIDER !== 'gemini') return null;
   const { GoogleGenAI, Type } = await import('@google/genai');
-  const ai = new GoogleGenAI({ ...geminiClientOptions, httpOptions: { ...GEMINI_HTTP_OPTIONS } });
+  const ai = new GoogleGenAI({
+    ...geminiClientOptions,
+    httpOptions: createGeminiHttpOptions({ signal }),
+  });
   const response = await ai.models.generateContent({
     model: MODEL_NAME,
     contents: JSON.stringify({ ticket, proposedCategory: category, proposedPriority: priority }),
