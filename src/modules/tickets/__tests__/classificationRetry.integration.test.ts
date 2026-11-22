@@ -13,16 +13,19 @@ import { errorHandler } from '../../../middleware';
 import router from '../../../router';
 import db from '../../../sequelize/models';
 import Ticket from '../../../sequelize/models/tickets.modal';
+import TicketProcessingOutbox from '../../../sequelize/models/ticket_processing_outbox.modal';
 import TicketStatusHistory from '../../../sequelize/models/ticket_status_history.modal';
 import TriageCache from '../../../sequelize/models/triage_cache.modal';
 import User from '../../../sequelize/models/users.modal';
 import { connectRabbitMq } from '../../../rabbitmq/connection';
 import { QueueAction, QueueName } from '../../../rabbitmq/enums';
 import { processTicket } from '../../../rabbitmq/handlers/ticketProcessing.handler';
+import { startTicketProcessingOutboxPublisher } from '../../../rabbitmq/outboxPublisher';
 import { sendToQueue } from '../../../rabbitmq/publisher';
-import { recoverStaleTickets, startQueueWorker } from '../../../rabbitmq/workers/worker';
+import { startQueueWorker } from '../../../rabbitmq/workers/worker';
 import { USER_ROLE } from '../../auth/enum/role';
 import { TICKET_STATUS_REASON, TICKET_TRIAGE_FAILURE_CODE, TRIAGE_STATUS } from '../enum';
+import { recoverStaleTickets } from '../helper/staleTicketRecovery.helper';
 
 // Use disposable PostgreSQL and RabbitMQ instances. The broker test deletes its queue.
 describe('support classification retry with PostgreSQL, RabbitMQ and the Gemini SDK', () => {
@@ -386,61 +389,72 @@ describe('support classification retry with PostgreSQL, RabbitMQ and the Gemini 
   );
 
   test(
-    'broker routing failure rolls back the retry and duplicate delivery classifies once',
+    'durably records retries during a broker outage and handles duplicate delivery once',
     { timeout: 8000 },
     async () => {
       const ticketId = Number((await makeTicket(TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION)).id);
       recoverGemini({ confidence: 0.5 });
       assert(broker);
+      await TicketProcessingOutbox.destroy({ where: {} });
       await broker.deleteQueue(QueueName.TICKET_PROCESSING);
-      const unavailable = await retry({ ticketId });
-      assert.equal(unavailable.status, 503);
-      assert.deepEqual(await unavailable.json(), {
-        data: [],
-        message: 'The classification queue is currently unavailable',
-        toast: false,
-        response_type: 'error',
-      });
+      const accepted = await retry({ ticketId });
+      assert.equal(accepted.status, 202);
       const waiting = await Ticket.findByPk(ticketId);
-      assert.equal(waiting?.triage_status, TRIAGE_STATUS.MANUAL_REVIEW);
-      assert.equal(waiting.triage_failure_code, TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION);
-      assert.equal(await TicketStatusHistory.count({ where: { ticket_id: ticketId } }), 0);
+      assert.equal(waiting?.triage_status, TRIAGE_STATUS.PENDING);
+      assert.equal(waiting?.triage_failure_code, null);
+      assert.equal(await TicketStatusHistory.count({ where: { ticket_id: ticketId } }), 1);
 
       await broker.close();
       broker = await connectRabbitMq();
-      assert.equal((await retry({ ticketId })).status, 202);
-      assert.equal((await broker.checkQueue(QueueName.TICKET_PROCESSING)).messageCount, 1);
-      await sendToQueue({
-        queueName: QueueName.TICKET_PROCESSING,
-        action: QueueAction.PROCESS_TICKET,
-        payload: { ticketId },
-      });
-      assert.equal((await broker.checkQueue(QueueName.TICKET_PROCESSING)).messageCount, 2);
-      await startQueueWorker({ queueName: QueueName.TICKET_PROCESSING, channel: broker });
-      const deadline = Date.now() + 4000;
-      let completed = false;
-      while (!completed && Date.now() < deadline) {
-        const currentTicket = await Ticket.findByPk(ticketId);
-        completed =
-          currentTicket?.triage_status === TRIAGE_STATUS.MANUAL_REVIEW &&
-          currentTicket.triage_failure_code === TICKET_TRIAGE_FAILURE_CODE.LOW_CONFIDENCE;
-        if (!completed) await new Promise((resolve) => setTimeout(resolve, 25));
+      let stopOutboxPublisher: (() => Promise<void>) | undefined;
+      let stopWorker: (() => Promise<void>) | undefined;
+      try {
+        stopOutboxPublisher = startTicketProcessingOutboxPublisher();
+        const publishDeadline = Date.now() + 4000;
+        let queued = false;
+        while (!queued && Date.now() < publishDeadline) {
+          queued = (await broker.checkQueue(QueueName.TICKET_PROCESSING)).messageCount > 0;
+          if (!queued) await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        assert.equal((await broker.checkQueue(QueueName.TICKET_PROCESSING)).messageCount, 1);
+        await sendToQueue({
+          queueName: QueueName.TICKET_PROCESSING,
+          action: QueueAction.PROCESS_TICKET,
+          payload: { ticketId },
+        });
+        assert.equal((await broker.checkQueue(QueueName.TICKET_PROCESSING)).messageCount, 2);
+        stopWorker = await startQueueWorker({
+          queueName: QueueName.TICKET_PROCESSING,
+          channel: broker,
+        });
+        const deadline = Date.now() + 4000;
+        let completed = false;
+        while (!completed && Date.now() < deadline) {
+          const currentTicket = await Ticket.findByPk(ticketId);
+          completed =
+            currentTicket?.triage_status === TRIAGE_STATUS.MANUAL_REVIEW &&
+            currentTicket.triage_failure_code === TICKET_TRIAGE_FAILURE_CODE.LOW_CONFIDENCE;
+          if (!completed) await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        assert(completed);
+        assert.equal(
+          await TicketStatusHistory.count({
+            where: { ticket_id: ticketId, new_status: TRIAGE_STATUS.PROCESSING },
+          }),
+          1
+        );
+        const details = await (await request({ path: `/${ticketId}` })).json();
+        assert.equal(details.data.ticket.triage_status, TRIAGE_STATUS.MANUAL_REVIEW);
+        assert.equal(
+          details.data.ticket.triage_failure_code,
+          TICKET_TRIAGE_FAILURE_CODE.LOW_CONFIDENCE
+        );
+        assert.equal(details.data.ticket.processing_attempt, 2);
+        assert.equal(details.data.canRetryClassification, false);
+      } finally {
+        await stopWorker?.();
+        await stopOutboxPublisher?.();
       }
-      assert(completed);
-      assert.equal(
-        await TicketStatusHistory.count({
-          where: { ticket_id: ticketId, new_status: TRIAGE_STATUS.PROCESSING },
-        }),
-        1
-      );
-      const details = await (await request({ path: `/${ticketId}` })).json();
-      assert.equal(details.data.ticket.triage_status, TRIAGE_STATUS.MANUAL_REVIEW);
-      assert.equal(
-        details.data.ticket.triage_failure_code,
-        TICKET_TRIAGE_FAILURE_CODE.LOW_CONFIDENCE
-      );
-      assert.equal(details.data.ticket.processing_attempt, 2);
-      assert.equal(details.data.canRetryClassification, false);
     }
   );
 });

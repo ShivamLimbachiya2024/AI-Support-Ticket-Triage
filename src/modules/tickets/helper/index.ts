@@ -1,17 +1,16 @@
 import db from '../../../sequelize/models';
 import Ticket from '../../../sequelize/models/tickets.modal';
 import TicketStatusHistory from '../../../sequelize/models/ticket_status_history.modal';
+import TicketProcessingOutbox from '../../../sequelize/models/ticket_processing_outbox.modal';
 import { logger } from '../../../logger';
 import { probeGeminiConnection } from '../../../rabbitmq/triage';
-import { QueueAction, QueueName, sendToQueue } from '../../../rabbitmq';
 import { TRIAGE_STATUS, TICKET_STATUS_REASON, TICKET_TRIAGE_FAILURE_CODE } from '../enum';
 
 export type ClassificationRetryResult =
   | { kind: 'accepted' }
   | { kind: 'notFound' }
   | { kind: 'notEligible' }
-  | { kind: 'geminiUnavailable' }
-  | { kind: 'queueUnavailable' };
+  | { kind: 'geminiUnavailable' };
 
 type RetryTransactionResult = 'accepted' | 'notFound' | 'notEligible';
 interface RetryClassificationInput {
@@ -20,15 +19,13 @@ interface RetryClassificationInput {
   actorUserId: number;
 }
 
-class ClassificationQueueUnavailableError extends Error {}
-
 export const canRetryClassification = (
   ticket: Pick<Ticket, 'triage_status' | 'triage_failure_code'>
 ): boolean =>
   ticket.triage_status === TRIAGE_STATUS.MANUAL_REVIEW &&
   ticket.triage_failure_code === TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION;
 
-const persistRetryAndPublish = async ({
+const persistClassificationRetry = async ({
   requestId,
   ticketId,
   actorUserId,
@@ -79,24 +76,11 @@ const persistRetryAndPublish = async ({
     );
     logger.info(`Request ${requestId} retry status history recorded for ticket ${ticketId}`);
 
-    logger.info(`Request ${requestId} publishing classification retry for ticket ${ticketId}`);
-    try {
-      await sendToQueue({
-        queueName: QueueName.TICKET_PROCESSING,
-        action: QueueAction.PROCESS_TICKET,
-        payload: { ticketId },
-      });
-    } catch {
-      logger.warn(
-        `Request ${requestId} retry transaction will roll back because RabbitMQ did not confirm ticket ${ticketId}`
-      );
-      throw new ClassificationQueueUnavailableError(
-        'RabbitMQ could not confirm the classification retry'
-      );
-    }
     logger.info(
-      `Request ${requestId} classification retry message confirmed for ticket ${ticketId}`
+      `Request ${requestId} recording the classification retry event for ticket ${ticketId}`
     );
+    await TicketProcessingOutbox.create({ ticket_id: ticketId }, { transaction });
+    logger.info(`Request ${requestId} classification retry event recorded for ticket ${ticketId}`);
     return 'accepted';
   });
 };
@@ -137,17 +121,11 @@ export const retryTicketClassification = async ({
 
   let outcome: RetryTransactionResult;
   try {
-    outcome = await persistRetryAndPublish({ requestId, ticketId, actorUserId });
+    outcome = await persistClassificationRetry({ requestId, ticketId, actorUserId });
     logger.info(
       `Request ${requestId} retry status transaction committed for ticket ${ticketId} with outcome ${outcome}`
     );
   } catch (error) {
-    if (error instanceof ClassificationQueueUnavailableError) {
-      logger.warn(
-        `Request ${requestId} classification retry transaction rolled back for ticket ${ticketId} because queue confirmation failed`
-      );
-      return { kind: 'queueUnavailable' };
-    }
     logger.error(
       `Request ${requestId} classification retry transaction failed for ticket ${ticketId} with ${error instanceof Error ? error.name : 'an unknown error'}`
     );

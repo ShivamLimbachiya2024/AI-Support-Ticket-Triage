@@ -5,10 +5,10 @@ import db from '../../../sequelize/models';
 import Ticket from '../../../sequelize/models/tickets.modal';
 import TriageResult from '../../../sequelize/models/triage_results.modal';
 import TicketStatusHistory from '../../../sequelize/models/ticket_status_history.modal';
+import TicketProcessingOutbox from '../../../sequelize/models/ticket_processing_outbox.modal';
 import { AuthRequest } from '../../../middleware';
 import { USER_ROLE } from '../../auth/enum/role';
 import { TRIAGE_STATUS, TICKET_STATUS_REASON } from '../enum';
-import { QueueAction, QueueName, sendToQueue } from '../../../rabbitmq';
 import type { ListTicketsQuery } from '../validation-schema';
 import { logger } from '../../../logger';
 import { canRetryClassification, retryTicketClassification } from '../helper';
@@ -68,16 +68,9 @@ export const submitTicket = async (req: AuthRequest, res: Response) => {
     );
     logger.info(`Request ${requestId} initial status history recorded for ticket ${created.id}`);
 
-    // The confirmed message becomes consumable when this transaction commits.
-    logger.info(
-      `Request ${requestId} publishing ticket ${created.id} to ${QueueName.TICKET_PROCESSING}`
-    );
-    await sendToQueue({
-      queueName: QueueName.TICKET_PROCESSING,
-      action: QueueAction.PROCESS_TICKET,
-      payload: { ticketId: Number(created.id) },
-    });
-    logger.info(`Request ${requestId} processing message confirmed for ticket ${created.id}`);
+    logger.info(`Request ${requestId} recording the processing event for ticket ${created.id}`);
+    await TicketProcessingOutbox.create({ ticket_id: Number(created.id) }, { transaction });
+    logger.info(`Request ${requestId} processing event recorded for ticket ${created.id}`);
 
     return created;
   });
@@ -293,14 +286,6 @@ export const retryClassification = async (req: AuthRequest, res: Response) => {
       generalResponse({
         response: res,
         message: 'Gemini is currently unavailable for classification',
-        responseType: 'error',
-        statusCode: 503,
-      });
-      return;
-    case 'queueUnavailable':
-      generalResponse({
-        response: res,
-        message: 'The classification queue is currently unavailable',
         responseType: 'error',
         statusCode: 503,
       });

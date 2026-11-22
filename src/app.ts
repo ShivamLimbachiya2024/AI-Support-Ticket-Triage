@@ -2,13 +2,25 @@ import 'express-async-errors';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import type { Server } from 'http';
 import router from './router';
 import db from './sequelize/models';
 import { APP_MODE, CONSUMER_TOPIC, FRONT_URL, PORT } from './config';
 import { errorHandler, notFoundHandler, requestLog } from './middleware';
 import { logger } from './logger';
-import { connectRabbitMq, QueueName, startQueueWorker } from './rabbitmq';
+import {
+  closeRabbitMq,
+  connectRabbitMq,
+  QueueName,
+  startQueueWorker,
+  startTicketProcessingOutboxPublisher,
+} from './rabbitmq';
 const app = express();
+let server: Server | undefined;
+let stopWorker: (() => Promise<void>) | undefined;
+let stopOutboxPublisher: (() => Promise<void>) | undefined;
+let shutdownPromise: Promise<void> | undefined;
+let isShuttingDown = false;
 
 app.use(requestLog);
 app.use(cors({ origin: FRONT_URL, credentials: true }));
@@ -22,6 +34,7 @@ const start = async () => {
   logger.info('PostgreSQL connection check started');
   await db.authenticate();
   logger.info('PostgreSQL connection established');
+  if (isShuttingDown) return;
 
   if (APP_MODE === 'worker') {
     logger.info(`Resolving worker queue from CONSUMER_TOPIC=${CONSUMER_TOPIC}`);
@@ -36,24 +49,61 @@ const start = async () => {
 
     logger.info(`Starting the ${queueName} worker`);
     const channel = await connectRabbitMq();
+    if (isShuttingDown) return;
+    stopWorker = await startQueueWorker({ queueName, channel });
+    if (isShuttingDown) {
+      await stopWorker();
+      return;
+    }
+    stopOutboxPublisher = startTicketProcessingOutboxPublisher();
     channel.once('close', () => {
-      logger.error(
-        `RabbitMQ worker channel closed for ${queueName}. Restarting the worker is required`
-      );
-      process.exit(1);
+      if (isShuttingDown) return;
+      logger.error(`RabbitMQ worker channel closed for ${queueName}`);
+      void shutdown({ reason: 'RabbitMQ channel closed', exitCode: 1 });
     });
-    await startQueueWorker({ queueName, channel });
     logger.info(`The ${queueName} worker started successfully`);
     return;
   }
 
   if (APP_MODE === 'api') {
+    stopOutboxPublisher = startTicketProcessingOutboxPublisher();
     logger.info(`Starting API listener on port ${PORT}`);
-    app.listen(PORT, () => logger.info('API listening on port ' + PORT));
+    server = app.listen(PORT, () => logger.info('API listening on port ' + PORT));
   }
 };
-start().catch((error) => {
-  logger.error('Startup failed: ' + error.message);
-  process.exit(1);
+
+const shutdown = ({ reason, exitCode }: { reason: string; exitCode: number }): Promise<void> => {
+  if (shutdownPromise) return shutdownPromise;
+  isShuttingDown = true;
+  process.exitCode = exitCode;
+  shutdownPromise = (async () => {
+    logger.info(`Application shutdown started: ${reason}`);
+
+    if (server) {
+      await new Promise<void>((resolve) => server?.close(() => resolve()));
+      logger.info('HTTP server stopped accepting requests');
+    }
+    await stopWorker?.();
+    await stopOutboxPublisher?.();
+    await closeRabbitMq();
+    await db.close();
+    logger.info('Application shutdown completed');
+  })().catch((error: unknown) => {
+    logger.error(
+      `Application shutdown failed with ${error instanceof Error ? error.name : 'an unknown error'}`
+    );
+    process.exitCode = 1;
+  });
+  return shutdownPromise;
+};
+
+process.once('SIGINT', () => void shutdown({ reason: 'SIGINT received', exitCode: 0 }));
+process.once('SIGTERM', () => void shutdown({ reason: 'SIGTERM received', exitCode: 0 }));
+
+start().catch((error: unknown) => {
+  logger.error(
+    `Startup failed with ${error instanceof Error ? error.message : 'an unknown error'}`
+  );
+  void shutdown({ reason: 'startup failure', exitCode: 1 });
 });
 export default app;

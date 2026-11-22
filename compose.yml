@@ -15,6 +15,7 @@ services:
       interval: 5s
       retries: 12
   rabbitmq:
+    restart: unless-stopped
     image: rabbitmq:4.3.7-management
     pull_policy: missing
     environment:

@@ -6,10 +6,19 @@ import TriageResult from './triage_results.modal';
 import TriageCache from './triage_cache.modal';
 import TicketEmbedding from './ticket_embeddings.modal';
 import TicketStatusHistory from './ticket_status_history.modal';
+import TicketProcessingOutbox from './ticket_processing_outbox.modal';
 const db = new Sequelize(DATABASE_URL, {
   dialect: 'postgres',
   logging: false,
-  models: [User, Ticket, TriageResult, TriageCache, TicketEmbedding, TicketStatusHistory],
+  models: [
+    User,
+    Ticket,
+    TriageResult,
+    TriageCache,
+    TicketEmbedding,
+    TicketStatusHistory,
+    TicketProcessingOutbox,
+  ],
 });
 Ticket.hasOne(TriageResult, { foreignKey: 'ticket_id', as: 'triage_result' });
 TriageResult.belongsTo(Ticket, { foreignKey: 'ticket_id' });

@@ -10,17 +10,16 @@ jest.mock('../../../sequelize/models/ticket_status_history.modal', () => ({
   __esModule: true,
   default: { create: jest.fn() },
 }));
-jest.mock('../../../rabbitmq/triage', () => ({ probeGeminiConnection: jest.fn() }));
-jest.mock('../../../rabbitmq', () => ({
-  QueueAction: { PROCESS_TICKET: 'process_ticket' },
-  QueueName: { TICKET_PROCESSING: 'ticket_processing' },
-  sendToQueue: jest.fn(),
+jest.mock('../../../sequelize/models/ticket_processing_outbox.modal', () => ({
+  __esModule: true,
+  default: { create: jest.fn() },
 }));
+jest.mock('../../../rabbitmq/triage', () => ({ probeGeminiConnection: jest.fn() }));
 
 import db from '../../../sequelize/models';
 import Ticket from '../../../sequelize/models/tickets.modal';
 import TicketStatusHistory from '../../../sequelize/models/ticket_status_history.modal';
-import { sendToQueue } from '../../../rabbitmq';
+import TicketProcessingOutbox from '../../../sequelize/models/ticket_processing_outbox.modal';
 import { probeGeminiConnection } from '../../../rabbitmq/triage';
 import { canRetryClassification, retryTicketClassification } from '../helper';
 import { TICKET_TRIAGE_FAILURE_CODE, TRIAGE_STATUS } from '../enum';
@@ -74,7 +73,7 @@ test('stops before the transaction when the Gemini availability probe fails', as
   expect(db.transaction).not.toHaveBeenCalled();
 });
 
-test('updates history and publishes the ticket after Gemini is available', async () => {
+test('updates history and records an outbox event after Gemini is available', async () => {
   const currentTicket = {
     triage_status: TRIAGE_STATUS.MANUAL_REVIEW,
     triage_failure_code: TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION,
@@ -95,7 +94,7 @@ test('updates history and publishes the ticket after Gemini is available', async
     callback({ LOCK: { UPDATE: 'UPDATE' } })
   );
   (TicketStatusHistory.create as jest.Mock).mockResolvedValue(undefined);
-  (sendToQueue as jest.Mock).mockResolvedValue(undefined);
+  (TicketProcessingOutbox.create as jest.Mock).mockResolvedValue(undefined);
 
   await expect(retryTicketClassification(retryInput)).resolves.toEqual({ kind: 'accepted' });
   expect(currentTicket.triage_status).toBe(TRIAGE_STATUS.PENDING);
@@ -110,7 +109,8 @@ test('updates history and publishes the ticket after Gemini is available', async
     }),
     expect.any(Object)
   );
-  expect(sendToQueue).toHaveBeenCalledWith(
-    expect.objectContaining({ payload: { ticketId: retryInput.ticketId } })
+  expect(TicketProcessingOutbox.create).toHaveBeenCalledWith(
+    { ticket_id: retryInput.ticketId },
+    expect.any(Object)
   );
 });
