@@ -1,4 +1,6 @@
 import { Response } from 'express';
+import _ from 'lodash';
+import generalResponse from '../../../helper';
 import db from '../../../sequelize/models';
 import Ticket from '../../../sequelize/models/tickets.modal';
 import TriageResult from '../../../sequelize/models/triage_results.modal';
@@ -9,6 +11,7 @@ import { TRIAGE_STATUS, TICKET_STATUS_REASON } from '../enum';
 import { QueueAction, QueueName, sendToQueue } from '../../../rabbitmq';
 import type { ListTicketsQuery } from '../validation-schema';
 import { logger } from '../../../logger';
+import { canRetryClassification, retryTicketClassification } from '../helper';
 
 export const submitTicket = async (req: AuthRequest, res: Response) => {
   const requestId = req.requestId ?? 'unknown';
@@ -23,7 +26,12 @@ export const submitTicket = async (req: AuthRequest, res: Response) => {
     logger.warn(
       `Request ${requestId} ticket submission rejected because the email did not match user ${req.userId}`
     );
-    res.status(400).json({ message: 'Ticket email must match the authenticated account' });
+    generalResponse({
+      response: res,
+      message: 'Ticket email must match the authenticated account',
+      responseType: 'error',
+      statusCode: 400,
+    });
     return;
   }
 
@@ -75,7 +83,12 @@ export const submitTicket = async (req: AuthRequest, res: Response) => {
   });
 
   logger.info(`Request ${requestId} ticket ${ticket.id} submission transaction committed`);
-  res.status(202).json({ id: ticket.id, triage_status: ticket.triage_status });
+  generalResponse({
+    response: res,
+    data: { id: ticket.id, triage_status: ticket.triage_status },
+    message: 'Ticket submitted successfully',
+    statusCode: 202,
+  });
   logger.info(
     `Request ${requestId} returned ticket ${ticket.id} with status ${ticket.triage_status}`
   );
@@ -85,14 +98,19 @@ export const getTicket = async (req: AuthRequest, res: Response) => {
   logger.info(
     `Request ${requestId} ticket lookup started for ticket ${req.params.id} and user ${req.userId}`
   );
-  const ticket = await Ticket.findByPk(req.params.id);
+  const ticket = await Ticket.findByPk(req.params.id, {});
   logger.info(`Request ${requestId} ticket lookup completed for ticket ${req.params.id}`);
 
   if (!ticket || (req.role !== USER_ROLE.SUPPORT && Number(ticket.customer_id) !== req.userId)) {
     logger.warn(
       `Request ${requestId} ticket ${req.params.id} was not found or was not accessible to user ${req.userId}`
     );
-    res.status(404).json({ message: 'Ticket not found' });
+    generalResponse({
+      response: res,
+      message: 'Ticket not found',
+      responseType: 'error',
+      statusCode: 404,
+    });
     return;
   }
 
@@ -100,7 +118,11 @@ export const getTicket = async (req: AuthRequest, res: Response) => {
     logger.info(
       `Request ${requestId} returning status-only details for customer-owned ticket ${ticket.id}`
     );
-    res.json({ id: ticket.id, triage_status: ticket.triage_status });
+    generalResponse({
+      response: res,
+      data: { id: ticket.id, triage_status: ticket.triage_status },
+      message: 'Ticket status retrieved successfully',
+    });
     logger.info(`Request ${requestId} returned ticket ${ticket.id} status ${ticket.triage_status}`);
     return;
   }
@@ -125,7 +147,15 @@ export const getTicket = async (req: AuthRequest, res: Response) => {
   logger.info(
     `Request ${requestId} triage result lookup completed for ticket ${ticket.id}: ${result ? 'result found' : 'result not available'}`
   );
-  res.json({ ticket, triage_result: result });
+  generalResponse({
+    response: res,
+    data: {
+      ticket,
+      triage_result: result,
+      canRetryClassification: canRetryClassification(ticket),
+    },
+    message: 'Ticket details retrieved successfully',
+  });
   logger.info(`Request ${requestId} returned support details for ticket ${ticket.id}`);
 };
 export const listTickets = async (req: AuthRequest, res: Response) => {
@@ -135,7 +165,12 @@ export const listTickets = async (req: AuthRequest, res: Response) => {
     logger.warn(
       `Request ${requestId} ticket list rejected because user ${req.userId} is not support`
     );
-    res.status(403).json({ message: 'Support access required' });
+    generalResponse({
+      response: res,
+      message: 'Support access required',
+      responseType: 'error',
+      statusCode: 403,
+    });
     return;
   }
   const { status, category, priority, page, limit } = req.validatedQuery as ListTicketsQuery;
@@ -156,6 +191,7 @@ export const listTickets = async (req: AuthRequest, res: Response) => {
       'customer_email',
       'triage_status',
       'status_reason',
+      'triage_failure_code',
       'retry_count',
       'last_retry_at',
       'processing_started_at',
@@ -194,6 +230,88 @@ export const listTickets = async (req: AuthRequest, res: Response) => {
   logger.info(
     `Request ${requestId} ticket list query completed with ${rows.length} rows from ${count} total`
   );
-  res.json({ data: rows, page, limit, total: count });
+  const data = rows.map((ticket) =>
+    _.assign(ticket.toJSON(), { canRetryClassification: canRetryClassification(ticket) })
+  );
+  generalResponse({
+    response: res,
+    data: { data, page, limit, total: count },
+    message: 'Tickets retrieved successfully',
+  });
   logger.info(`Request ${requestId} ticket list response returned`);
+};
+
+export const retryClassification = async (req: AuthRequest, res: Response) => {
+  const requestId = req.requestId ?? 'unknown';
+  const ticketId = Number(req.params.id);
+
+  if (req.role !== USER_ROLE.SUPPORT) {
+    logger.warn(`Request ${requestId} classification retry denied for user ${req.userId}`);
+    generalResponse({
+      response: res,
+      message: 'Support access required',
+      responseType: 'error',
+      statusCode: 403,
+    });
+    return;
+  }
+
+  if (req.userId === undefined) {
+    logger.warn(`Request ${requestId} classification retry rejected without an authenticated user`);
+    generalResponse({
+      response: res,
+      message: 'Authentication required',
+      responseType: 'error',
+      statusCode: 401,
+    });
+    return;
+  }
+
+  const result = await retryTicketClassification({
+    requestId,
+    ticketId,
+    actorUserId: req.userId,
+  });
+  switch (result.kind) {
+    case 'notFound':
+      generalResponse({
+        response: res,
+        message: 'Ticket not found',
+        responseType: 'error',
+        statusCode: 404,
+      });
+      return;
+    case 'notEligible':
+      generalResponse({
+        response: res,
+        message: 'Ticket is no longer eligible for classification retry',
+        responseType: 'error',
+        statusCode: 409,
+      });
+      return;
+    case 'geminiUnavailable':
+      generalResponse({
+        response: res,
+        message: 'Gemini is currently unavailable for classification',
+        responseType: 'error',
+        statusCode: 503,
+      });
+      return;
+    case 'queueUnavailable':
+      generalResponse({
+        response: res,
+        message: 'The classification queue is currently unavailable',
+        responseType: 'error',
+        statusCode: 503,
+      });
+      return;
+    case 'accepted':
+      generalResponse({
+        response: res,
+        data: { id: ticketId, triage_status: TRIAGE_STATUS.PENDING },
+        message: 'Classification retry accepted',
+        statusCode: 202,
+      });
+      return;
+  }
 };

@@ -6,6 +6,7 @@ jest.mock('../../config', () => ({
   PROMPT_VERSION: 'test_prompt_version',
 }));
 
+import _ from 'lodash';
 import { GEMINI_HTTP_OPTIONS, runGeminiTriage } from '../triage';
 import { TICKET_CATEGORY, TICKET_PRIORITY } from '../../modules/tickets/enum';
 
@@ -63,6 +64,7 @@ test('retries rejected Gemini output, isolates ticket data, and configures SDK t
     confidence: 0.9,
   });
   expect(GEMINI_HTTP_OPTIONS).toEqual({
+    baseUrl: 'https://generativelanguage.googleapis.com',
     timeout: 30000,
     retryOptions: {
       attempts: 3,
@@ -88,4 +90,24 @@ test('retries rejected Gemini output, isolates ticket data, and configures SDK t
   expect(JSON.parse(mockGenerateContent.mock.calls[2][0].contents).correctionReason).toContain(
     'not urgency evidence'
   );
+});
+
+test('preserves a Gemini transport failure separately from invalid classification output', async () => {
+  const reset = _.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+  const generateContent = jest.fn().mockRejectedValue(reset);
+
+  await expect(
+    runGeminiTriage({
+      input: { subject: 'Account help', body: 'Please reset my password.' },
+      ai: { models: { generateContent } },
+      type: {
+        OBJECT: 'OBJECT',
+        STRING: 'STRING',
+        ARRAY: 'ARRAY',
+        BOOLEAN: 'BOOLEAN',
+        NUMBER: 'NUMBER',
+      },
+    })
+  ).rejects.toMatchObject({ kind: 'connection' });
+  expect(generateContent).toHaveBeenCalledTimes(1);
 });

@@ -6,6 +6,7 @@ export default interface ITicket {
   customer_email: string;
   triage_status: string;
   status_reason?: string | null;
+  triage_failure_code?: string | null;
   retry_count: number;
   last_retry_at?: Date | null;
   processing_started_at?: Date | null;

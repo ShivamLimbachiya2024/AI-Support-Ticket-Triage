@@ -1,3 +1,4 @@
+import type { GenerateContentParameters } from '@google/genai' with { 'resolution-mode': 'import' };
 import { TICKET_CATEGORY, TICKET_PRIORITY } from '../../modules/tickets/enum';
 
 export interface TriageOutput {
@@ -32,7 +33,7 @@ export interface GeminiSchemaTypes {
 
 export interface GeminiClient {
   models: {
-    generateContent: (request: any) => Promise<{ text?: string }>;
+    generateContent: (request: GenerateContentParameters) => Promise<{ text?: string }>;
   };
 }
 

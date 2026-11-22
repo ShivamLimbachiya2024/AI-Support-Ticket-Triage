@@ -1,53 +1,69 @@
-/** Failure classes based on Gemini's documented HTTP error behavior. */
-export type FailureKind =
-  'transient' | 'rateLimit' | 'quota' | 'configuration' | 'invalidRequest' | 'unclassified';
+import _ from 'lodash';
 
-export interface FailureDecision {
-  kind: FailureKind;
+import { GEMINI_FAILURE_KIND } from '../rabbitmq/enums';
+
+interface FailureDecision {
+  kind: GEMINI_FAILURE_KIND;
 }
 
 interface GeminiApiError {
-  status?: number;
-  message?: string;
-  code?: string | number;
+  status?: unknown;
+  code?: unknown;
+  name?: unknown;
+  cause?: unknown;
 }
 
-/**
- * Classify Gemini SDK failures using ApiError.status and documented HTTP
- * semantics. Retry timing is handled by RabbitMQ's quorum queue policy.
- */
+const transportErrorCodes = new Set([
+  'ECONNABORTED',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EAI_AGAIN',
+  'ETIMEDOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
 export const classifyProviderError = ({ error }: { error: unknown }): FailureDecision => {
-  if (!(error instanceof Error)) return { kind: 'unclassified' };
+  const visited = new Set<object>();
+  let current = error;
+  let hasTransportFailure = false;
 
-  const providerError = error as GeminiApiError;
-  const status = providerError.status;
+  while (_.isObject(current) && !visited.has(current)) {
+    visited.add(current);
+    const { status, code, name, cause } = current as GeminiApiError;
+    // generateContent reports an explicit HTTP response as ApiError.status.
+    if (typeof status === 'number') {
+      if (status === 429) return { kind: GEMINI_FAILURE_KIND.RATE_LIMIT };
+      if ([408, 500, 502, 503, 504].includes(status))
+        return { kind: GEMINI_FAILURE_KIND.TRANSIENT };
+      if (status === 402) return { kind: GEMINI_FAILURE_KIND.PAYMENT_REQUIRED };
+      if (status === 401 || status === 403) return { kind: GEMINI_FAILURE_KIND.CONFIGURATION };
+      if ([400, 404, 422].includes(status)) return { kind: GEMINI_FAILURE_KIND.INVALID_REQUEST };
+      return { kind: GEMINI_FAILURE_KIND.UNCLASSIFIED };
+    }
 
-  if (status === 429) {
-    return { kind: 'rateLimit' };
+    // The SDK signals its own request timeout with AbortError. Triage supplies no caller signal.
+    if (
+      (typeof code === 'string' && transportErrorCodes.has(code)) ||
+      name === 'TimeoutError' ||
+      name === 'AbortError'
+    ) {
+      hasTransportFailure = true;
+    }
+    current = cause;
   }
 
-  if (status === 408 || status === 500 || status === 502 || status === 503 || status === 504) {
-    return { kind: 'transient' };
-  }
-  if (status === 402) return { kind: 'quota' };
-  if (status === 401 || status === 403) return { kind: 'configuration' };
-  if (status === 400 || status === 404 || status === 422) return { kind: 'invalidRequest' };
-
-  const transportErrorCodes = new Set([
-    'ECONNABORTED',
-    'ECONNREFUSED',
-    'ECONNRESET',
-    'EAI_AGAIN',
-    'ETIMEDOUT',
-    'UND_ERR_CONNECT_TIMEOUT',
-    'UND_ERR_HEADERS_TIMEOUT',
-    'UND_ERR_SOCKET',
-  ]);
-  const errorCode = (error as Error & { code?: unknown }).code;
-  if (typeof errorCode === 'string' && transportErrorCodes.has(errorCode)) {
-    return { kind: 'transient' };
-  }
-  if (error.name === 'AbortError' || error.name === 'TimeoutError') return { kind: 'transient' };
-
-  return { kind: 'unclassified' };
+  if (hasTransportFailure) return { kind: GEMINI_FAILURE_KIND.CONNECTION };
+  return { kind: GEMINI_FAILURE_KIND.UNCLASSIFIED };
 };
+
+export class GeminiRequestError extends Error {
+  readonly kind: GEMINI_FAILURE_KIND;
+
+  constructor(cause: unknown) {
+    super('Gemini request failed');
+    this.kind = classifyProviderError({ error: cause }).kind;
+  }
+}

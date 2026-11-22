@@ -1,4 +1,4 @@
-import { ConsumeMessage } from 'amqplib';
+import type { ConfirmChannel, ConsumeMessage } from 'amqplib';
 import { Op } from 'sequelize';
 import { logger } from '../../logger';
 import db from '../../sequelize/models';
@@ -8,7 +8,6 @@ import { TRIAGE_STATUS, TICKET_STATUS_REASON } from '../../modules/tickets/enum'
 import { QueueAction, QueueName } from '../enums';
 import type { QueueHandler, QueuePayload } from '../types';
 import { queuePayloadSchema } from '../schemas';
-import { getRabbitChannel } from '../connection';
 import { processTicket } from '../handlers/ticketProcessing.handler';
 import { sendToQueue } from '../publisher';
 
@@ -17,33 +16,27 @@ const staleTicketTimeoutMs = 30 * 60 * 1000;
 
 const queueHandlers: Record<QueueName, Partial<Record<QueueAction, QueueHandler>>> = {
   [QueueName.TICKET_PROCESSING]: {
-    [QueueAction.PROCESS_TICKET]: ({ ticketId }) => processTicket(ticketId),
+    [QueueAction.PROCESS_TICKET]: processTicket,
   },
 };
 
 /** Consume messages from one configured queue and dispatch only its handlers. */
-export const startQueueWorker = async (queueName: QueueName): Promise<void> => {
-  const channel = getRabbitChannel();
+export const startQueueWorker = async ({
+  queueName,
+  channel,
+}: {
+  queueName: QueueName;
+  channel: ConfirmChannel;
+}): Promise<void> => {
   logger.info(`Setting consumer prefetch to 1 for queue ${queueName}`);
   await channel.prefetch(1);
   logger.info(`Consumer prefetch is ready for queue ${queueName}`);
-
-  if (queueName === QueueName.TICKET_PROCESSING) {
-    logger.info(`Scheduling stale ticket recovery every 10 minutes for queue ${queueName}`);
-    recoverStaleTickets().catch((error) =>
-      logger.error('Stale ticket recovery failed: ' + error.message)
-    );
-    setInterval(() => {
-      recoverStaleTickets().catch((error) =>
-        logger.error('Stale ticket recovery failed: ' + error.message)
-      );
-    }, staleTicketRecoveryIntervalMs);
-  }
 
   logger.info(`Registering consumer for queue ${queueName}`);
   await channel.consume(queueName, async (message: ConsumeMessage | null) => {
     if (!message) {
       logger.warn(`RabbitMQ cancelled the consumer for queue ${queueName}`);
+      void channel.close().catch(() => undefined);
       return;
     }
 
@@ -93,17 +86,28 @@ export const startQueueWorker = async (queueName: QueueName): Promise<void> => {
         logger.info(`Message for ticket ${payload.ticketId} acknowledged`);
       }
     } catch (error) {
-      logger.error(`Message processing from ${queueName} failed: ${(error as Error).message}`);
+      logger.error(
+        `Message processing from ${queueName} failed with ${error instanceof Error ? error.name : 'an unknown error'}`
+      );
       logger.info(`Returning failed ${queueName} message to RabbitMQ for delayed redelivery`);
       channel.reject(message, true);
       logger.info(`Failed ${queueName} message returned to RabbitMQ`);
     }
   });
   logger.info(`Consumer registered successfully for queue ${queueName}`);
+  if (queueName === QueueName.TICKET_PROCESSING) {
+    logger.info(`Scheduling stale ticket recovery for ${queueName}`);
+    const recover = () =>
+      recoverStaleTickets().catch(() => logger.error('Stale ticket recovery scan failed'));
+    const recoveryTimer = setInterval(() => void recover(), staleTicketRecoveryIntervalMs);
+    void recover();
+
+    channel.once('close', () => clearInterval(recoveryTimer));
+  }
 };
 
 /** Requeue processing tickets abandoned by a crashed worker. */
-const recoverStaleTickets = async (): Promise<void> => {
+export const recoverStaleTickets = async (): Promise<void> => {
   const staleBefore = new Date(Date.now() - staleTicketTimeoutMs);
   logger.debug('Stale ticket recovery scan started');
   const staleTickets = await Ticket.findAll({
@@ -124,57 +128,62 @@ const recoverStaleTickets = async (): Promise<void> => {
   for (const staleTicket of staleTickets) {
     const ticketId = Number(staleTicket.id);
     logger.info(`Stale recovery transaction started for ticket ${ticketId}`);
-    await db.transaction(async (transaction) => {
-      const ticket = await Ticket.findByPk(ticketId, {
-        lock: transaction.LOCK.UPDATE,
-        transaction,
-      });
+    await db
+      .transaction(async (transaction) => {
+        const ticket = await Ticket.findByPk(ticketId, {
+          lock: transaction.LOCK.UPDATE,
+          transaction,
+        });
 
-      if (!ticket) {
-        logger.info(`Stale recovery skipped ticket ${ticketId} because it no longer exists`);
-        return;
-      }
+        if (!ticket) {
+          logger.info(`Stale recovery skipped ticket ${ticketId} because it no longer exists`);
+          return;
+        }
 
-      if (
-        ticket.triage_status !== TRIAGE_STATUS.PROCESSING ||
-        !ticket.processing_started_at ||
-        ticket.processing_started_at >= staleBefore
-      ) {
+        if (
+          ticket.triage_status !== TRIAGE_STATUS.PROCESSING ||
+          !ticket.processing_started_at ||
+          ticket.processing_started_at >= staleBefore
+        ) {
+          logger.info(
+            `Stale recovery skipped ticket ${ticketId} because its processing state changed`
+          );
+          return;
+        }
+
         logger.info(
-          `Stale recovery skipped ticket ${ticketId} because its processing state changed`
+          `Stale ticket ${ticketId} transition started: ${TRIAGE_STATUS.PROCESSING} to ${TRIAGE_STATUS.PENDING}`
         );
-        return;
-      }
+        ticket.triage_status = TRIAGE_STATUS.PENDING;
+        ticket.status_reason = TICKET_STATUS_REASON.PROCESSING_TIMEOUT;
+        ticket.processing_started_at = null;
+        await ticket.save({ transaction });
+        logger.info(`Stale ticket ${ticketId} status updated to ${TRIAGE_STATUS.PENDING}`);
 
-      logger.info(
-        `Stale ticket ${ticketId} transition started: ${TRIAGE_STATUS.PROCESSING} to ${TRIAGE_STATUS.PENDING}`
+        logger.info(`Recording stale recovery status history for ticket ${ticketId}`);
+        await TicketStatusHistory.create(
+          {
+            ticket_id: Number(ticket.id),
+            previous_status: TRIAGE_STATUS.PROCESSING,
+            new_status: TRIAGE_STATUS.PENDING,
+            reason: ticket.status_reason,
+            retry_count: ticket.retry_count,
+          },
+          { transaction }
+        );
+        logger.info(`Stale recovery status history recorded for ticket ${ticketId}`);
+
+        logger.info(`Republishing ticket ${ticketId} to ${QueueName.TICKET_PROCESSING}`);
+        await sendToQueue({
+          queueName: QueueName.TICKET_PROCESSING,
+          action: QueueAction.PROCESS_TICKET,
+          payload: { ticketId },
+        });
+      })
+      .then(
+        () => logger.info(`Stale recovery transaction committed for ticket ${ticketId}`),
+        () => logger.error(`Stale recovery transaction failed for ticket ${ticketId}`)
       );
-      ticket.triage_status = TRIAGE_STATUS.PENDING;
-      ticket.status_reason = TICKET_STATUS_REASON.PROCESSING_TIMEOUT;
-      await ticket.save({ transaction });
-      logger.info(`Stale ticket ${ticketId} status updated to ${TRIAGE_STATUS.PENDING}`);
-
-      logger.info(`Recording stale recovery status history for ticket ${ticketId}`);
-      await TicketStatusHistory.create(
-        {
-          ticket_id: Number(ticket.id),
-          previous_status: TRIAGE_STATUS.PROCESSING,
-          new_status: TRIAGE_STATUS.PENDING,
-          reason: ticket.status_reason,
-          retry_count: ticket.retry_count,
-        },
-        { transaction }
-      );
-      logger.info(`Stale recovery status history recorded for ticket ${ticketId}`);
-
-      logger.info(`Republishing ticket ${ticketId} to ${QueueName.TICKET_PROCESSING}`);
-      await sendToQueue({
-        queueName: QueueName.TICKET_PROCESSING,
-        action: QueueAction.PROCESS_TICKET,
-        payload: { ticketId: Number(ticket.id) },
-      });
-    });
-    logger.info(`Stale recovery transaction committed for ticket ${ticketId}`);
   }
 
   logger.info(`Stale ticket recovery completed for ${staleTickets.length} ticket(s)`);

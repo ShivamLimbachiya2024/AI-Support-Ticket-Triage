@@ -12,6 +12,8 @@ export const ticketParamsSchema = Joi.object({
   id: Joi.number().integer().min(1).max(Number.MAX_SAFE_INTEGER).required(),
 }).required();
 
+export const retryClassificationSchema = Joi.object().max(0).default({});
+
 export interface ListTicketsQuery {
   status?: TRIAGE_STATUS;
   category?: TICKET_CATEGORY;

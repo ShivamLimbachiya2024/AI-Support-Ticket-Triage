@@ -1,13 +1,15 @@
 import { Response } from 'express';
 
-const generalResponse = (resObject: {
+interface GeneralResponseOptions {
   response: Response;
-  data?: any;
+  data?: unknown;
   message: string;
-  responseType?: string;
+  responseType?: 'success' | 'error';
   toast?: boolean;
   statusCode?: number;
-}) => {
+}
+
+const generalResponse = (resObject: GeneralResponseOptions): void => {
   const {
     response,
     data = [],
@@ -16,10 +18,10 @@ const generalResponse = (resObject: {
     toast = false,
     statusCode = 200,
   } = resObject;
-  response.status(statusCode).send({
-    data: data,
-    message: message,
-    toast: toast,
+  response.status(statusCode).json({
+    data,
+    message,
+    toast,
     response_type: responseType,
   });
 };

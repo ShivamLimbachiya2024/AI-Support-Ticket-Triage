@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import Joi from 'joi';
 import jwt from 'jsonwebtoken';
 import { JWT_SECRET } from '../config';
+import generalResponse from '../helper';
 import { logger } from '../logger';
 import User from '../sequelize/models/users.modal';
 export interface AuthRequest extends Request {
@@ -23,7 +24,12 @@ export const validate =
       logger.warn(
         `Request ${requestId} ${source} validation failed with ${error.details.length} issue(s)`
       );
-      res.status(400).json({ message: error.message });
+      generalResponse({
+        response: res,
+        message: error.message,
+        responseType: 'error',
+        statusCode: 400,
+      });
       return;
     }
 
@@ -47,7 +53,12 @@ export const validateQuery =
       logger.warn(
         `Request ${requestId} query validation failed with ${error.details.length} issue(s)`
       );
-      res.status(400).json({ message: error.message });
+      generalResponse({
+        response: res,
+        message: error.message,
+        responseType: 'error',
+        statusCode: 400,
+      });
       return;
     }
 
@@ -62,7 +73,12 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
   const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '');
   if (!token) {
     logger.warn(`Request ${requestId} authentication rejected because no token was provided`);
-    res.status(401).json({ message: 'Authentication required' });
+    generalResponse({
+      response: res,
+      message: 'Authentication required',
+      responseType: 'error',
+      statusCode: 401,
+    });
     return;
   }
   let payload: { id: number; role: string };
@@ -71,7 +87,12 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
     payload = jwt.verify(token, JWT_SECRET) as { id: number; role: string };
   } catch {
     logger.warn(`Request ${requestId} authentication rejected because the token was invalid`);
-    res.status(401).json({ message: 'Invalid token' });
+    generalResponse({
+      response: res,
+      message: 'Invalid token',
+      responseType: 'error',
+      statusCode: 401,
+    });
     return;
   }
   logger.info(`Request ${requestId} token verified; loading account ${payload.id}`);
@@ -80,7 +101,12 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
     logger.warn(
       `Request ${requestId} authentication rejected because account ${payload.id} was not found`
     );
-    res.status(401).json({ message: 'Account not found' });
+    generalResponse({
+      response: res,
+      message: 'Account not found',
+      responseType: 'error',
+      statusCode: 401,
+    });
     return;
   }
   req.userId = Number(user.id);
@@ -122,5 +148,23 @@ export const errorHandler = (
 ) => {
   const requestId = (req as AuthRequest).requestId ?? 'unknown';
   logger.error(`Request ${requestId} ${req.method} ${req.path} failed: ${error.message}`);
-  if (!res.headersSent) res.status(500).json({ message: 'Internal server error' });
+  if (!res.headersSent) {
+    generalResponse({
+      response: res,
+      message: 'Internal server error',
+      responseType: 'error',
+      statusCode: 500,
+    });
+  }
+};
+
+export const notFoundHandler = (req: Request, res: Response) => {
+  const requestId = (req as AuthRequest).requestId ?? 'unknown';
+  logger.warn(`Request ${requestId} route not found: ${req.method} ${req.path}`);
+  generalResponse({
+    response: res,
+    message: 'Route not found',
+    responseType: 'error',
+    statusCode: 404,
+  });
 };

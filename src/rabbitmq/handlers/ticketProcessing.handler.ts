@@ -8,17 +8,35 @@ import { EMBEDDING_MODEL, MODEL_NAME, PROMPT_VERSION } from '../../config';
 import {
   TRIAGE_STATUS,
   TICKET_STATUS_REASON,
+  TICKET_TRIAGE_FAILURE_CODE,
   ticketProcessingReasonByPreviousStatus,
 } from '../../modules/tickets/enum';
 import { logger } from '../../logger';
-import { classifyProviderError } from '../../utils/retry';
-import { cachedTriage, embedText, verifySemanticReuse, SEMANTIC_REUSE_THRESHOLD } from '../triage';
+import { GeminiRequestError } from '../../utils/retry';
+import { GEMINI_FAILURE_KIND } from '../enums';
+import {
+  cachedTriage,
+  embedText,
+  InvalidClassificationError,
+  verifySemanticReuse,
+  SEMANTIC_REUSE_THRESHOLD,
+} from '../triage';
+
+const providerFailureReasons = {
+  [GEMINI_FAILURE_KIND.CONNECTION]: TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED,
+  [GEMINI_FAILURE_KIND.TRANSIENT]: TICKET_STATUS_REASON.GEMINI_TEMPORARILY_UNAVAILABLE,
+  [GEMINI_FAILURE_KIND.RATE_LIMIT]: TICKET_STATUS_REASON.GEMINI_RATE_LIMITED,
+  [GEMINI_FAILURE_KIND.PAYMENT_REQUIRED]: TICKET_STATUS_REASON.GEMINI_PAYMENT_REQUIRED,
+  [GEMINI_FAILURE_KIND.CONFIGURATION]: TICKET_STATUS_REASON.GEMINI_CONFIGURATION_FAILED,
+  [GEMINI_FAILURE_KIND.INVALID_REQUEST]: TICKET_STATUS_REASON.GEMINI_REQUEST_REJECTED,
+  [GEMINI_FAILURE_KIND.UNCLASSIFIED]: TICKET_STATUS_REASON.CLASSIFICATION_FAILED,
+};
 
 /**
  * Claim and triage a ticket. The row lock is released before model inference.
  * processing_attempt fences completions from stale worker deliveries.
  */
-export const processTicket = async (ticketId: number): Promise<boolean> => {
+export const processTicket = async ({ ticketId }: { ticketId: number }): Promise<boolean> => {
   logger.info(`Ticket ${ticketId} processing workflow started`);
   let processingAttempt: number | undefined;
 
@@ -50,7 +68,12 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
     ticket.triage_status = TRIAGE_STATUS.PROCESSING;
     ticket.processing_attempt += 1;
     ticket.processing_started_at = new Date();
-    if (previousStatus === TRIAGE_STATUS.RETRY_WAIT) ticket.last_retry_at = new Date();
+    const reason = ticketProcessingReasonByPreviousStatus[previousStatus];
+    ticket.status_reason = reason;
+    ticket.triage_failure_code = null;
+    if (previousStatus === TRIAGE_STATUS.RETRY_WAIT) {
+      ticket.last_retry_at = ticket.processing_started_at;
+    }
     processingAttempt = ticket.processing_attempt;
     await ticket.save({ transaction });
     logger.info(
@@ -63,7 +86,7 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         ticket_id: ticketId,
         previous_status: previousStatus,
         new_status: TRIAGE_STATUS.PROCESSING,
-        reason: ticketProcessingReasonByPreviousStatus[previousStatus],
+        reason,
         retry_count: ticket.retry_count,
       },
       { transaction }
@@ -81,8 +104,12 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
 
   logger.info(`Ticket ${ticketId} reload before triage started for attempt ${processingAttempt}`);
   const ticket = await Ticket.findByPk(ticketId);
-  if (!ticket) {
-    logger.warn(`Ticket ${ticketId} disappeared after claim; no triage call will be made`);
+  if (
+    !ticket ||
+    ticket.processing_attempt !== processingAttempt ||
+    ticket.triage_status !== TRIAGE_STATUS.PROCESSING
+  ) {
+    logger.warn(`Ticket ${ticketId} claim is no longer current before model inference`);
     return false;
   }
   logger.info(
@@ -142,7 +169,11 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
       currentTicket.triage_status = newStatus;
       currentTicket.status_reason = confident
         ? TICKET_STATUS_REASON.TRIAGE_COMPLETED
-        : 'Low classification confidence';
+        : TICKET_STATUS_REASON.LOW_CLASSIFICATION_CONFIDENCE;
+      currentTicket.triage_failure_code = confident
+        ? null
+        : TICKET_TRIAGE_FAILURE_CODE.LOW_CONFIDENCE;
+      currentTicket.processing_started_at = null;
       currentTicket.completed_at = new Date();
       await currentTicket.save({ transaction });
       logger.info(`Ticket ${ticketId} status updated to ${currentTicket.triage_status}`);
@@ -176,14 +207,26 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
     logger.info(`Ticket ${ticketId} duplicate detection completed`);
     return false;
   } catch (error) {
-    const reason = error instanceof Error ? error.message : 'Provider failure';
-    const invalidOutput = reason.startsWith('Invalid model output');
-    const failure = invalidOutput
-      ? { kind: 'invalidRequest' as const }
-      : classifyProviderError({ error });
+    if (!(error instanceof GeminiRequestError) && !(error instanceof InvalidClassificationError)) {
+      logger.error(
+        `Ticket ${ticketId} attempt ${processingAttempt} was interrupted by an application error`
+      );
+      throw error;
+    }
+    const invalidOutput = error instanceof InvalidClassificationError;
+    const kind =
+      error instanceof GeminiRequestError ? error.kind : GEMINI_FAILURE_KIND.UNCLASSIFIED;
+    const reason = invalidOutput
+      ? TICKET_STATUS_REASON.INVALID_CLASSIFICATION
+      : providerFailureReasons[kind];
+    let failureCode: TICKET_TRIAGE_FAILURE_CODE | null = null;
+    if (invalidOutput) failureCode = TICKET_TRIAGE_FAILURE_CODE.INVALID_CLASSIFICATION;
+    if (kind === GEMINI_FAILURE_KIND.CONNECTION)
+      failureCode = TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION;
     let shouldRetry = false;
+    let failurePersisted = false;
 
-    logger.error(`Ticket ${ticketId} triage attempt failed: ${reason}`);
+    logger.error(`Ticket ${ticketId} triage attempt failed: ${reason}; failure_kind=${kind}`);
     logger.info(`Ticket ${ticketId} failure status transaction started`);
     await db.transaction(async (transaction) => {
       logger.info(`Ticket ${ticketId} failure row lock requested`);
@@ -204,7 +247,7 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
       }
 
       const canRetry =
-        (failure.kind === 'transient' || failure.kind === 'rateLimit') &&
+        (kind === GEMINI_FAILURE_KIND.TRANSIENT || kind === GEMINI_FAILURE_KIND.RATE_LIMIT) &&
         currentTicket.retry_count < 3;
       shouldRetry = canRetry;
       const previousStatus = currentTicket.triage_status;
@@ -212,6 +255,9 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         ? TRIAGE_STATUS.RETRY_WAIT
         : TRIAGE_STATUS.MANUAL_REVIEW;
       currentTicket.status_reason = reason;
+      currentTicket.triage_failure_code = failureCode;
+      currentTicket.processing_started_at = null;
+      currentTicket.completed_at = canRetry ? null : new Date();
       if (canRetry) currentTicket.retry_count += 1;
 
       logger.info(
@@ -232,9 +278,16 @@ export const processTicket = async (ticketId: number): Promise<boolean> => {
         { transaction }
       );
       logger.info(`Ticket ${ticketId} failure history recorded with reason: ${reason}`);
+      failurePersisted = true;
     });
 
     logger.info(`Ticket ${ticketId} failure status transaction completed`);
+    if (!failurePersisted) {
+      logger.warn(
+        `Ticket ${ticketId} failure status was not changed because its processing attempt became stale`
+      );
+      return false;
+    }
     if (shouldRetry) {
       logger.info(`Ticket ${ticketId} is retryable; requesting RabbitMQ delayed redelivery`);
     } else {

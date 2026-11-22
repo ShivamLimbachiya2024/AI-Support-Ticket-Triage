@@ -5,7 +5,7 @@ import cookieParser from 'cookie-parser';
 import router from './router';
 import db from './sequelize/models';
 import { APP_MODE, CONSUMER_TOPIC, FRONT_URL, PORT } from './config';
-import { errorHandler, requestLog } from './middleware';
+import { errorHandler, notFoundHandler, requestLog } from './middleware';
 import { logger } from './logger';
 import { connectRabbitMq, QueueName, startQueueWorker } from './rabbitmq';
 const app = express();
@@ -15,16 +15,13 @@ app.use(cors({ origin: FRONT_URL, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 app.use(router);
+app.use(notFoundHandler);
 app.use(errorHandler);
 const start = async () => {
   logger.info(`Application startup started in ${APP_MODE} mode`);
   logger.info('PostgreSQL connection check started');
   await db.authenticate();
   logger.info('PostgreSQL connection established');
-
-  logger.info('RabbitMQ connection setup started');
-  await connectRabbitMq();
-  logger.info('RabbitMQ connection setup completed');
 
   if (APP_MODE === 'worker') {
     logger.info(`Resolving worker queue from CONSUMER_TOPIC=${CONSUMER_TOPIC}`);
@@ -38,7 +35,14 @@ const start = async () => {
     }
 
     logger.info(`Starting the ${queueName} worker`);
-    await startQueueWorker(queueName);
+    const channel = await connectRabbitMq();
+    channel.once('close', () => {
+      logger.error(
+        `RabbitMQ worker channel closed for ${queueName}. Restarting the worker is required`
+      );
+      process.exit(1);
+    });
+    await startQueueWorker({ queueName, channel });
     logger.info(`The ${queueName} worker started successfully`);
     return;
   }
