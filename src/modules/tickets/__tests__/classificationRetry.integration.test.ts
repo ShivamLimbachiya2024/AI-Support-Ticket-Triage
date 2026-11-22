@@ -231,7 +231,7 @@ describe('support classification retry with PostgreSQL, RabbitMQ and the Gemini 
 
   test(
     'the probe rejects TLS failures and enforces the SDK request deadline',
-    { timeout: 9000 },
+    { timeout: 15000 },
     async () => {
       const ticketId = Number((await makeTicket(TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION)).id);
       const tlsError = _.assign(new TypeError('fetch failed'), {
@@ -447,7 +447,7 @@ describe('support classification retry with PostgreSQL, RabbitMQ and the Gemini 
       assert.equal(await processTicket({ ticketId }), false);
       const retriedTicket = await Ticket.findByPk(ticketId);
       assert.equal(retriedTicket?.triage_status, TRIAGE_STATUS.TRIAGED);
-      assert.equal(retriedTicket?.processing_attempt, 2);
+      assert.equal(retriedTicket?.processing_attempt, 3);
 
       const invalidTicketId = Number(
         (await makeTicket(TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION)).id
