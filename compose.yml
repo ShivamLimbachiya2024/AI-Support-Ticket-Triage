@@ -1,5 +1,6 @@
 services:
   postgres:
+    image: postgres-pgvector:16
     build:
       context: .
       dockerfile: docker/Dockerfile.postgres

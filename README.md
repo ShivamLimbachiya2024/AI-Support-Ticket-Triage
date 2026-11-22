@@ -18,7 +18,7 @@ Compose runs a single RabbitMQ node. Its quorum queue is durable on the mounted 
 
 For a no-key run, set `MODEL_PROVIDER=fake`, `MODEL_NAME=fake_v1`, and `EMBEDDING_MODEL=fake_embedding_v1`. For a lower-cost real Gemini run, set `MODEL_PROVIDER=gemini`, `MODEL_NAME=gemini-3.5-flash-lite`, `EMBEDDING_MODEL=gemini-embedding-2`, and `GEMINI_API_KEY`. `GEMINI_API_KEY` is required only in Gemini mode. Confirm the model has a nonzero quota for your project in Google AI Studio. When running the app outside Compose, set the host in `DATABASE_URL` to the address where PostgreSQL is reachable, such as `localhost`.
 
-Run npm test and npm run build. Migrations use Sequelize CLI and the pgvector extension is bootstrapped by the PostgreSQL image. The pgvector image builds from the `postgres:16` and `pgvector/pgvector:0.8.1-pg16` base images; Compose downloads `rabbitmq:4.3.7-management` when it is missing locally.
+Run npm test and npm run build. Migrations use Sequelize CLI and the pgvector extension is bootstrapped by the PostgreSQL image. Compose builds the PostgreSQL image as `postgres-pgvector:16` from the `postgres:16` and `pgvector/pgvector:0.8.1-pg16` base images; it downloads `rabbitmq:4.3.7-management` when it is missing locally.
 
 ## API
 
