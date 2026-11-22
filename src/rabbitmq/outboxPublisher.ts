@@ -37,8 +37,10 @@ const publishPendingMessages = async (): Promise<void> => {
       });
       if (published) logger.info(`Ticket ${ticketId} outbox message published and removed`);
     } catch {
+      let ticketDescription = '';
+      if (ticketId) ticketDescription = ` for ticket ${ticketId}`;
       logger.warn(
-        `Ticket processing outbox delivery failed${ticketId ? ` for ticket ${ticketId}` : ''}; it will be retried`
+        `Ticket processing outbox delivery failed${ticketDescription}; it will be retried`
       );
       return;
     }

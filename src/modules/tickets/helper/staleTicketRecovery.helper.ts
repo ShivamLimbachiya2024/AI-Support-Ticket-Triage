@@ -42,13 +42,23 @@ export const recoverStaleTickets = async (): Promise<void> => {
           return;
         }
 
-        if (
-          ticket.triage_status !== TRIAGE_STATUS.PROCESSING ||
-          !ticket.processing_started_at ||
-          ticket.processing_started_at >= staleBefore
-        ) {
+        const ticketIsNotProcessing = ticket.triage_status !== TRIAGE_STATUS.PROCESSING;
+        if (ticketIsNotProcessing) {
           logger.info(
-            `Stale recovery skipped ticket ${ticketId} because its processing state changed`
+            `Stale recovery skipped ticket ${ticketId} because its status is ${ticket.triage_status}`
+          );
+          return;
+        }
+        if (!ticket.processing_started_at) {
+          logger.info(
+            `Stale recovery skipped ticket ${ticketId} because its processing start time is missing`
+          );
+          return;
+        }
+        const processingStartIsRecent = ticket.processing_started_at >= staleBefore;
+        if (processingStartIsRecent) {
+          logger.info(
+            `Stale recovery skipped ticket ${ticketId} because processing started after the recovery cutoff`
           );
           return;
         }

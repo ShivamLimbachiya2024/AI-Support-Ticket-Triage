@@ -1,6 +1,6 @@
 # Ticket processing flow
 
-The Express API accepts the ticket and returns HTTP `202` once submission commits. A separate RabbitMQ worker classifies the ticket and records the outcome in PostgreSQL. The status describes the triage workflow. `manual_review` is an end state for automatic processing; support can request another classification for eligible Gemini connection failures.
+The Express API accepts the ticket and returns HTTP `202` once submission commits. A separate RabbitMQ worker classifies the ticket and records the outcome in PostgreSQL. The status describes the triage workflow. `manual_review` is also used while a Gemini connection retry waits in RabbitMQ; support can manually retry only after the automatic retry budget is exhausted.
 
 All API responses use the shared `{ data, message, toast, response_type }` envelope. `response_type` is `success` for successful responses and `error` for failures; the HTTP status code remains authoritative. Error responses use an empty array for `data`.
 
@@ -51,7 +51,7 @@ A RabbitMQ publish confirmation can precede the PostgreSQL commit. If the worker
 
 ```mermaid
 flowchart TD
-    A["processTicket: lock ticket row in claim transaction"] --> B{"Ticket exists and status is pending or retry_wait?"}
+    A["processTicket: lock ticket row in claim transaction"] --> B{"Ticket exists and status is pending, retry_wait, or marked connection retry?"}
     B -- No --> Z["Return false to worker"]
     B -- Yes --> C["Set processing, increment processing_attempt<br/>Set processing_started_at and write history"]
     C --> D["Commit claim, release row lock, reload ticket"]
@@ -73,30 +73,35 @@ flowchart TD
     K -- Transaction error --> M
     M --> N{"Failure row lock: same attempt and still processing?"}
     N -- No --> Z
-    N -- Yes --> P{"Transient or rateLimit and retry_count below 3?"}
-    P -- Yes --> Q["Set retry_wait and increment retry_count<br/>Save reason, write history, commit"]
-    Q --> R["Return true to worker"]
+    N -- Yes --> P{"Connection, transient, or rateLimit and retry_count below 3?"}
+    P -- Yes --> Q{"Connection failure?"}
+    Q -- Yes --> Q1["Keep manual_review<br/>Set scheduled reason and increment retry_count"]
+    Q1 --> R["Commit failure state<br/>Return true to worker"]
+    Q -- No --> Q2["Set retry_wait<br/>Increment retry_count and write history"]
+    Q2 --> R
     P -- No --> S["Set manual_review<br/>Save reason, write history, commit"]
     S --> Z
 ```
 
-The [processing handler](../src/rabbitmq/handlers/ticketProcessing.handler.ts) sets `last_retry_at` when it claims a ticket from `retry_wait`. The claim, completion, and failure transactions each lock the ticket row and write transition history with the current retry count. Completion and failure also require the row to exist, the stored `processing_attempt` to match the claim, and the status to remain `processing`. An exception during claim, reload, or failure handling can propagate to the consumer and trigger a requeue. `completed_at` is written for the valid-result completion paths, including low-confidence results. Those paths save the classification and its source, model name, and prompt version.
+The [processing handler](../src/rabbitmq/handlers/ticketProcessing.handler.ts) sets `last_retry_at` when it claims a ticket from `retry_wait` or the specifically marked connection-retry state. It uses `includes` for the allowed-status check. The claim, completion, and failure transactions each lock the ticket row and write transition history with the current retry count. Completion and failure also require the row to exist, the stored `processing_attempt` to match the claim, and the status to remain `processing`. A connection retry keeps `manual_review` while delayed, then the worker locks the row and changes it to `processing` before inference. The retry API rejects that scheduled reason, preventing a support-triggered run from racing with the delayed delivery. An exception during claim, reload, or failure handling can propagate to the consumer and trigger a requeue. `completed_at` remains empty while a connection retry is scheduled. Successful classification paths save the result source, model name, and prompt version.
 
-| Transition                     | Gate and history reason                                                                                                        |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| New → `pending`                | Submission succeeds. History reason is `Ticket submitted`.                                                                     |
-| `pending` → `processing`       | Worker claims the ticket. History reason is `Processing started`.                                                              |
-| `retry_wait` → `processing`    | Worker claims a retry. History reason is `Retry processing started`.                                                           |
-| `processing` → `triaged`       | Valid result with confidence ≥ 0.85. Reason is `Triage completed`.                                                             |
-| `processing` → `manual_review` | Valid result with confidence below 0.85 or missing. Reason is `Low classification confidence`.                                 |
-| `processing` → `retry_wait`    | Retryable failure while `retry_count < 3`. Reason is the error message, or `Provider failure` for a non-Error value.           |
-| `processing` → `manual_review` | Non-retryable failure or exhausted retries. Reason is the error message, or `Provider failure` for a non-Error value.          |
-| `processing` → `pending`       | Stale recovery finds the ticket still processing and older than 30 minutes. Reason is `Previous processing attempt timed out`. |
+| Transition                     | Gate and history reason                                                                                                                                                                      |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| New → `pending`                | Submission succeeds. History reason is `Ticket submitted`.                                                                                                                                   |
+| `pending` → `processing`       | Worker claims the ticket. History reason is `Processing started`.                                                                                                                            |
+| `retry_wait` → `processing`    | Worker claims a retry. History reason is `Retry processing started`.                                                                                                                         |
+| `manual_review` → `processing` | Worker claims only when the reason is `Gemini connection retry scheduled` and the failure code is `geminiConnection`. History reason is `Retry processing started`.                          |
+| `processing` → `triaged`       | Valid result with confidence ≥ 0.85. Reason is `Triage completed`.                                                                                                                           |
+| `processing` → `manual_review` | Valid result with confidence below 0.85 or missing. Reason is `Low classification confidence`.                                                                                               |
+| `processing` → `retry_wait`    | Retryable HTTP failure while `retry_count < 3`. Reason identifies the provider failure.                                                                                                      |
+| `processing` → `manual_review` | Connection failure while `retry_count < 3` stays in manual review with reason `Gemini connection retry scheduled`; the worker requests delayed redelivery and manual retry remains disabled. |
+| `processing` → `manual_review` | Non-retryable failure or exhausted retries. A connection failure uses reason `Gemini connection failed`, enabling support retry.                                                             |
+| `processing` → `pending`       | Stale recovery finds the ticket still processing and older than 30 minutes. Reason is `Previous processing attempt timed out`.                                                               |
 
 ### How retries are decided
 
 - [Gemini request options](../src/rabbitmq/triage.ts) configure a 30-second request timeout and three SDK attempts. The candidate correction loop in section 3 is a separate limit.
-- [`classifyProviderError`](../src/utils/retry.ts) treats HTTP `429` as `rateLimit`. It treats HTTP `408`, `500`, `502`, `503`, `504`, named `AbortError` or `TimeoutError`, and the transport codes listed in the function as `transient`. HTTP `402` is `quota`, `401/403` is `configuration`, and `400/404/422` is `invalidRequest`. Other errors are `unclassified`. The handler treats messages starting with `Invalid model output` as `invalidRequest`.
+- [`classifyProviderError`](../src/utils/retry.ts) treats HTTP `429` as `rateLimit`, HTTP `408`, `500`, `502`, `503`, and `504` as `transient`, and the Gemini SDK's `APIConnectionError`, `APIConnectionTimeoutError`, `RequestTimeoutError`, `ConnectionError`, plus recognized socket codes as `connection`. Native `TimeoutError` values in the cause chain are also retryable; explicit abort errors are not. Connection, transient HTTP, and rate-limit failures receive up to three delayed application retries. HTTP `402` is a payment problem, `401/403` is `configuration`, and `400/404/422` is `invalidRequest`. Other errors are `unclassified`.
 - [`connectRabbitMq`](../src/rabbitmq/connection.ts) configures native delayed retry of failed deliveries with a 30-second minimum and 120-second maximum. The [README retry policy](../README.md#accuracy-and-retry-policy) documents the usual 30-, 60-, and 90-second delays for three consecutive application retries. The worker uses `reject(message, true)` to request broker redelivery.
 
 ### How an abandoned claim is recovered
@@ -192,7 +197,7 @@ All ticket read routes run `authenticate` before validation.
 | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /api/tickets/:id` → `getTicket`                                 | `ticketParamsSchema` requires a positive safe integer ID. Validation failure returns `400`. A missing ticket or a different owner's ticket requested by a customer returns `404`. The success envelope's `data` contains `{ id, triage_status }` for customers or `{ ticket, triage_result, canRetryClassification }` for support. The result is `null` when no result row exists.                                                                                                |
 | `GET /api/tickets` → `listTickets`                                   | `validateQuery(listTicketsQuerySchema)` checks optional `status`, `category`, and `priority` against the ticket enums. Page defaults to 1 and limit defaults to 20 with a maximum of 100. Invalid or unknown query fields return `400`. Valid requests from a non-support user return `403`. The success envelope's `data` contains `{ data, page, limit, total }`, with tickets ordered newest first. Filtering by category or priority requires a matching `triage_result` row. |
-| `POST /api/tickets/:id/retry-classification` → `retryClassification` | Support can retry only tickets in `manual_review` with `geminiConnection` failure code. The API probes Gemini before the locked state recheck. Success returns `202` with the ticket ID and `pending` status in the envelope's `data`. A missing ticket returns `404`, an ineligible ticket returns `409`, and unavailable Gemini or RabbitMQ returns `503`.                                                                                                                      |
+| `POST /api/tickets/:id/retry-classification` → `retryClassification` | Support can retry only tickets in `manual_review` with `geminiConnection` failure code and reason `Gemini connection failed`. A scheduled connection retry has a different reason and is ineligible. The API probes Gemini before the locked state recheck. Success returns `202` with ticket ID and `pending` status in `data`. A missing ticket returns `404`, an ineligible ticket returns `409`, and unavailable Gemini returns `503`.                                        |
 
 See the [ticket router](../src/modules/tickets/router/index.ts), [read schemas](../src/modules/tickets/validation-schema/index.ts), and [controllers](../src/modules/tickets/controller/index.ts).
 

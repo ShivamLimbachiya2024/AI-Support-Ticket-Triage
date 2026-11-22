@@ -144,7 +144,7 @@ describe('support classification retry with PostgreSQL, RabbitMQ and the Gemini 
   const retry = ({ ticketId, role }: { ticketId: number; role?: USER_ROLE }) =>
     request({ path: `/${ticketId}/retry-classification`, role, method: 'POST' });
 
-  test('exposes the SDK connection failure to support and keeps customer responses status-only', async () => {
+  test('keeps scheduled connection retries in manual review until a worker claims them', async () => {
     const ticket = await makeTicket();
     const ticketId = Number(ticket.id);
     let attempts = 0;
@@ -157,18 +157,22 @@ describe('support classification retry with PostgreSQL, RabbitMQ and the Gemini 
       throw _.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
     });
 
-    assert.equal(await processTicket({ ticketId }), false);
+    assert.equal(await processTicket({ ticketId }), true);
     // The SDK's installed p-retry stops on Node's fetch failed TypeError.
     assert.equal(attempts, 1);
     const details = await (await request({ path: `/${ticketId}` })).json();
     assert.equal(details.data.ticket.triage_status, TRIAGE_STATUS.MANUAL_REVIEW);
-    assert.equal(details.data.ticket.status_reason, TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED);
-    assert.equal(details.data.ticket.retry_count, 0);
-    assert.equal(details.data.canRetryClassification, true);
+    assert.equal(
+      details.data.ticket.status_reason,
+      TICKET_STATUS_REASON.GEMINI_CONNECTION_RETRY_SCHEDULED
+    );
+    assert.equal(details.data.ticket.retry_count, 1);
+    assert.equal(details.data.ticket.completed_at, null);
+    assert.equal(details.data.canRetryClassification, false);
     const list = await (await request({ path: '?status=manual_review' })).json();
     assert.equal(
       list.data.data.find((row: { id: number }) => row.id === ticket.id)?.canRetryClassification,
-      true
+      false
     );
     const customer = await (
       await request({ path: `/${ticketId}`, role: USER_ROLE.CUSTOMER })
@@ -264,6 +268,114 @@ describe('support classification retry with PostgreSQL, RabbitMQ and the Gemini 
   });
 
   test(
+    'retries Gemini timeouts three times, stays in manual review while scheduled, then allows support retry',
+    { timeout: 8000 },
+    async () => {
+      const ticketId = Number((await makeTicket()).id);
+      let timeoutAttempts = 0;
+      providerFetch.mock.mockImplementation(async (url) => {
+        if (!String(url).endsWith(':generateContent')) {
+          const embedding = { values: [1, ...Array(1535).fill(0)] };
+          return Response.json({ embedding, embeddings: [embedding] });
+        }
+        timeoutAttempts += 1;
+        throw new DOMException('Gemini request timed out', 'TimeoutError');
+      });
+
+      for (let attempt = 1; attempt <= 4; attempt += 1) {
+        assert.equal(await processTicket({ ticketId }), attempt < 4);
+        const ticket = await Ticket.findByPk(ticketId);
+        assert.equal(ticket?.triage_status, TRIAGE_STATUS.MANUAL_REVIEW);
+        assert.equal(ticket?.retry_count, Math.min(attempt, 3));
+        assert.equal(
+          ticket?.status_reason,
+          attempt < 4
+            ? TICKET_STATUS_REASON.GEMINI_CONNECTION_RETRY_SCHEDULED
+            : TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED
+        );
+        assert.equal(
+          ticket?.completed_at === null,
+          attempt < 4,
+          'scheduled connection retries stay incomplete until the retry budget is exhausted'
+        );
+        const details = await (await request({ path: `/${ticketId}` })).json();
+        assert.equal(details.data.canRetryClassification, attempt === 4);
+      }
+
+      assert(timeoutAttempts >= 4, 'each delayed worker attempt should reach Gemini');
+    }
+  );
+
+  test(
+    'locks a scheduled connection retry into processing before a duplicate delivery can claim it',
+    { timeout: 8000 },
+    async () => {
+      const ticketId = Number((await makeTicket()).id);
+      providerFetch.mock.mockImplementation(async (url) => {
+        if (!String(url).endsWith(':generateContent')) {
+          const embedding = { values: [1, ...Array(1535).fill(0)] };
+          return Response.json({ embedding, embeddings: [embedding] });
+        }
+        throw _.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+      });
+      assert.equal(await processTicket({ ticketId }), true);
+
+      let announceInference!: () => void;
+      let resumeInference!: () => void;
+      const inferenceStarted = new Promise<void>((resolve) => {
+        announceInference = resolve;
+      });
+      const resume = new Promise<void>((resolve) => {
+        resumeInference = resolve;
+      });
+      let generationCalls = 0;
+      providerFetch.mock.mockImplementation(async (url, options) => {
+        if (!String(url).endsWith(':generateContent')) {
+          const embedding = { values: [1, ...Array(1535).fill(0)] };
+          return Response.json({ embedding, embeddings: [embedding] });
+        }
+        generationCalls += 1;
+        if (generationCalls === 1) {
+          announceInference();
+          await resume;
+        }
+        const text = JSON.parse(String(options?.body)).contents[0].parts[0].text;
+        if (text === 'Reply OK.') return modelResponse('OK');
+        const payload = JSON.parse(text);
+        if (payload.candidate) return modelResponse({ accepted: true, reason: 'Supported' });
+        return modelResponse({
+          category: 'account',
+          priority: 'medium',
+          summary: 'The customer requests help resetting a password.',
+          confidence: 0.95,
+          evidence: ['reset my password'],
+        });
+      });
+
+      const delayedDelivery = processTicket({ ticketId });
+      await inferenceStarted;
+      const duplicateDelivery = await processTicket({ ticketId });
+      assert.equal(duplicateDelivery, false);
+      assert.equal(generationCalls, 1);
+      const processingTicket = await Ticket.findByPk(ticketId);
+      assert.equal(processingTicket?.triage_status, TRIAGE_STATUS.PROCESSING);
+      assert.equal(processingTicket?.processing_attempt, 2);
+
+      resumeInference();
+      await delayedDelivery;
+      const completedTicket = await Ticket.findByPk(ticketId);
+      assert.equal(completedTicket?.triage_status, TRIAGE_STATUS.TRIAGED);
+      assert.equal(completedTicket?.processing_attempt, 2);
+      assert.equal(
+        await TicketStatusHistory.count({
+          where: { ticket_id: ticketId, new_status: TRIAGE_STATUS.PROCESSING },
+        }),
+        2
+      );
+    }
+  );
+
+  test(
     'concurrent requests persist one retry and probe with the configured model and no ticket data',
     { timeout: 8000 },
     async () => {
@@ -309,7 +421,7 @@ describe('support classification retry with PostgreSQL, RabbitMQ and the Gemini 
   );
 
   test(
-    'a renewed connection failure stays eligible but an invalid classification closes the retry',
+    'delayed connection retry restores processing while invalid output remains ineligible',
     { timeout: 8000 },
     async () => {
       const ticketId = Number((await makeTicket(TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION)).id);
@@ -318,20 +430,36 @@ describe('support classification retry with PostgreSQL, RabbitMQ and the Gemini 
       providerFetch.mock.mockImplementation(async () => {
         throw _.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
       });
-      assert.equal(await processTicket({ ticketId }), false);
+      assert.equal(await processTicket({ ticketId }), true);
+      const scheduledRetry = await Ticket.findByPk(ticketId);
+      assert.equal(scheduledRetry?.triage_status, TRIAGE_STATUS.MANUAL_REVIEW);
       assert.equal(
-        (await Ticket.findByPk(ticketId))?.triage_failure_code,
+        scheduledRetry?.status_reason,
+        TICKET_STATUS_REASON.GEMINI_CONNECTION_RETRY_SCHEDULED
+      );
+      assert.equal(
+        scheduledRetry?.triage_failure_code,
         TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION
       );
+      assert.equal((await retry({ ticketId })).status, 409);
 
       recoverGemini();
-      assert.equal((await retry({ ticketId })).status, 202);
-      providerFetch.mock.mockImplementation(async () => modelResponse({ category: 'bad output' }));
       assert.equal(await processTicket({ ticketId }), false);
-      const ticket = await Ticket.findByPk(ticketId);
+      const retriedTicket = await Ticket.findByPk(ticketId);
+      assert.equal(retriedTicket?.triage_status, TRIAGE_STATUS.TRIAGED);
+      assert.equal(retriedTicket?.processing_attempt, 2);
+
+      const invalidTicketId = Number(
+        (await makeTicket(TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION)).id
+      );
+      recoverGemini();
+      assert.equal((await retry({ ticketId: invalidTicketId })).status, 202);
+      providerFetch.mock.mockImplementation(async () => modelResponse({ category: 'bad output' }));
+      assert.equal(await processTicket({ ticketId: invalidTicketId }), false);
+      const ticket = await Ticket.findByPk(invalidTicketId);
       assert.equal(ticket?.triage_status, TRIAGE_STATUS.MANUAL_REVIEW);
       assert.equal(ticket.triage_failure_code, TICKET_TRIAGE_FAILURE_CODE.INVALID_CLASSIFICATION);
-      assert.equal((await retry({ ticketId })).status, 409);
+      assert.equal((await retry({ ticketId: invalidTicketId })).status, 409);
     }
   );
 

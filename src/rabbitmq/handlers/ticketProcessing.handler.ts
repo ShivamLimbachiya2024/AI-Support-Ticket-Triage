@@ -31,6 +31,13 @@ const providerFailureReasons = {
   [GEMINI_FAILURE_KIND.INVALID_REQUEST]: TICKET_STATUS_REASON.GEMINI_REQUEST_REJECTED,
   [GEMINI_FAILURE_KIND.UNCLASSIFIED]: TICKET_STATUS_REASON.CLASSIFICATION_FAILED,
 };
+const claimableStatuses: string[] = [TRIAGE_STATUS.PENDING, TRIAGE_STATUS.RETRY_WAIT];
+const retryableFailureKinds: GEMINI_FAILURE_KIND[] = [
+  GEMINI_FAILURE_KIND.CONNECTION,
+  GEMINI_FAILURE_KIND.TRANSIENT,
+  GEMINI_FAILURE_KIND.RATE_LIMIT,
+];
+const maxDelayedRetries = 3;
 
 /**
  * Claim and triage a ticket. The row lock is released before model inference.
@@ -51,16 +58,20 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
     }
 
     logger.info(`Ticket ${ticketId} row locked with status ${ticket.triage_status}`);
-    if (
-      ticket.triage_status !== TRIAGE_STATUS.PENDING &&
-      ticket.triage_status !== TRIAGE_STATUS.RETRY_WAIT
-    ) {
+    const connectionRetryScheduled =
+      ticket.triage_status === TRIAGE_STATUS.MANUAL_REVIEW &&
+      ticket.status_reason === TICKET_STATUS_REASON.GEMINI_CONNECTION_RETRY_SCHEDULED &&
+      ticket.triage_failure_code === TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION;
+    const processableStatuses = [...claimableStatuses];
+    if (connectionRetryScheduled) processableStatuses.push(TRIAGE_STATUS.MANUAL_REVIEW);
+    if (!processableStatuses.includes(ticket.triage_status)) {
       logger.info(
         `Ticket ${ticketId} claim skipped because status ${ticket.triage_status} is not eligible`
       );
       return;
     }
-    const previousStatus = ticket.triage_status;
+    const previousStatus = ticket.triage_status as
+      TRIAGE_STATUS.PENDING | TRIAGE_STATUS.RETRY_WAIT | TRIAGE_STATUS.MANUAL_REVIEW;
 
     logger.info(
       `Ticket ${ticketId} claim transition started: ${previousStatus} to ${TRIAGE_STATUS.PROCESSING}`
@@ -71,7 +82,8 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
     const reason = ticketProcessingReasonByPreviousStatus[previousStatus];
     ticket.status_reason = reason;
     ticket.triage_failure_code = null;
-    if (previousStatus === TRIAGE_STATUS.RETRY_WAIT) {
+    const previousStatusNeedsRetryTimestamp = previousStatus === TRIAGE_STATUS.RETRY_WAIT;
+    if (previousStatusNeedsRetryTimestamp || connectionRetryScheduled) {
       ticket.last_retry_at = ticket.processing_started_at;
     }
     processingAttempt = ticket.processing_attempt;
@@ -104,12 +116,18 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
 
   logger.info(`Ticket ${ticketId} reload before triage started for attempt ${processingAttempt}`);
   const ticket = await Ticket.findByPk(ticketId);
-  if (
-    !ticket ||
-    ticket.processing_attempt !== processingAttempt ||
-    ticket.triage_status !== TRIAGE_STATUS.PROCESSING
-  ) {
-    logger.warn(`Ticket ${ticketId} claim is no longer current before model inference`);
+  if (!ticket) {
+    logger.warn(`Ticket ${ticketId} disappeared after its processing claim`);
+    return false;
+  }
+  const processingAttemptChanged = ticket.processing_attempt !== processingAttempt;
+  if (processingAttemptChanged) {
+    logger.warn(`Ticket ${ticketId} claim is stale because its processing attempt changed`);
+    return false;
+  }
+  const ticketIsNotProcessing = ticket.triage_status !== TRIAGE_STATUS.PROCESSING;
+  if (ticketIsNotProcessing) {
+    logger.warn(`Ticket ${ticketId} claim is stale because its status is ${ticket.triage_status}`);
     return false;
   }
   logger.info(
@@ -138,12 +156,20 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
         transaction,
       });
 
-      if (
-        !currentTicket ||
-        currentTicket.processing_attempt !== processingAttempt ||
-        currentTicket.triage_status !== TRIAGE_STATUS.PROCESSING
-      ) {
-        logger.info(`Ticket ${ticketId} completion skipped because its attempt or status changed`);
+      if (!currentTicket) {
+        logger.info(`Ticket ${ticketId} completion skipped because the ticket no longer exists`);
+        return;
+      }
+      const completionAttemptChanged = currentTicket.processing_attempt !== processingAttempt;
+      if (completionAttemptChanged) {
+        logger.info(`Ticket ${ticketId} completion skipped because its processing attempt changed`);
+        return;
+      }
+      const completionStatusChanged = currentTicket.triage_status !== TRIAGE_STATUS.PROCESSING;
+      if (completionStatusChanged) {
+        logger.info(
+          `Ticket ${ticketId} completion skipped because its status is ${currentTicket.triage_status}`
+        );
         return;
       }
 
@@ -162,17 +188,21 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
       logger.info(`Ticket ${ticketId} triage result persistence completed`);
 
       const confident = (triageResult.result.confidence ?? 0) >= 0.85;
-      const newStatus = confident ? TRIAGE_STATUS.TRIAGED : TRIAGE_STATUS.MANUAL_REVIEW;
+      let newStatus = TRIAGE_STATUS.MANUAL_REVIEW;
+      let statusReason = TICKET_STATUS_REASON.LOW_CLASSIFICATION_CONFIDENCE;
+      let failureCode: TICKET_TRIAGE_FAILURE_CODE | null =
+        TICKET_TRIAGE_FAILURE_CODE.LOW_CONFIDENCE;
+      if (confident) {
+        newStatus = TRIAGE_STATUS.TRIAGED;
+        statusReason = TICKET_STATUS_REASON.TRIAGE_COMPLETED;
+        failureCode = null;
+      }
       logger.info(
         `Ticket ${ticketId} status transition started: ${TRIAGE_STATUS.PROCESSING} to ${newStatus}`
       );
       currentTicket.triage_status = newStatus;
-      currentTicket.status_reason = confident
-        ? TICKET_STATUS_REASON.TRIAGE_COMPLETED
-        : TICKET_STATUS_REASON.LOW_CLASSIFICATION_CONFIDENCE;
-      currentTicket.triage_failure_code = confident
-        ? null
-        : TICKET_TRIAGE_FAILURE_CODE.LOW_CONFIDENCE;
+      currentTicket.status_reason = statusReason;
+      currentTicket.triage_failure_code = failureCode;
       currentTicket.processing_started_at = null;
       currentTicket.completed_at = new Date();
       await currentTicket.save({ transaction });
@@ -214,15 +244,14 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
       throw error;
     }
     const invalidOutput = error instanceof InvalidClassificationError;
-    const kind =
-      error instanceof GeminiRequestError ? error.kind : GEMINI_FAILURE_KIND.UNCLASSIFIED;
-    const reason = invalidOutput
-      ? TICKET_STATUS_REASON.INVALID_CLASSIFICATION
-      : providerFailureReasons[kind];
+    let kind = GEMINI_FAILURE_KIND.UNCLASSIFIED;
+    if (error instanceof GeminiRequestError) kind = error.kind;
+    let reason = providerFailureReasons[kind];
+    if (invalidOutput) reason = TICKET_STATUS_REASON.INVALID_CLASSIFICATION;
     let failureCode: TICKET_TRIAGE_FAILURE_CODE | null = null;
     if (invalidOutput) failureCode = TICKET_TRIAGE_FAILURE_CODE.INVALID_CLASSIFICATION;
-    if (kind === GEMINI_FAILURE_KIND.CONNECTION)
-      failureCode = TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION;
+    const connectionFailure = kind === GEMINI_FAILURE_KIND.CONNECTION;
+    if (connectionFailure) failureCode = TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION;
     let shouldRetry = false;
     let failurePersisted = false;
 
@@ -235,29 +264,46 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
         transaction,
       });
 
-      if (
-        !currentTicket ||
-        currentTicket.processing_attempt !== processingAttempt ||
-        currentTicket.triage_status !== TRIAGE_STATUS.PROCESSING
-      ) {
+      if (!currentTicket) {
         logger.info(
-          `Ticket ${ticketId} failure update skipped because its attempt or status changed`
+          `Ticket ${ticketId} failure update skipped because the ticket no longer exists`
+        );
+        return;
+      }
+      const failureAttemptChanged = currentTicket.processing_attempt !== processingAttempt;
+      if (failureAttemptChanged) {
+        logger.info(`Ticket ${ticketId} failure update skipped because its attempt changed`);
+        return;
+      }
+      const failureStatusChanged = currentTicket.triage_status !== TRIAGE_STATUS.PROCESSING;
+      if (failureStatusChanged) {
+        logger.info(
+          `Ticket ${ticketId} failure update skipped because its status is ${currentTicket.triage_status}`
         );
         return;
       }
 
-      const canRetry =
-        (kind === GEMINI_FAILURE_KIND.TRANSIENT || kind === GEMINI_FAILURE_KIND.RATE_LIMIT) &&
-        currentTicket.retry_count < 3;
+      const failureKindCanRetry = retryableFailureKinds.includes(kind);
+      const retryBudgetAvailable = currentTicket.retry_count < maxDelayedRetries;
+      const canRetry = failureKindCanRetry && retryBudgetAvailable;
+      const scheduledConnectionRetry = canRetry && connectionFailure;
       shouldRetry = canRetry;
       const previousStatus = currentTicket.triage_status;
-      currentTicket.triage_status = canRetry
-        ? TRIAGE_STATUS.RETRY_WAIT
-        : TRIAGE_STATUS.MANUAL_REVIEW;
-      currentTicket.status_reason = reason;
+      if (scheduledConnectionRetry) {
+        currentTicket.triage_status = TRIAGE_STATUS.MANUAL_REVIEW;
+        currentTicket.status_reason = TICKET_STATUS_REASON.GEMINI_CONNECTION_RETRY_SCHEDULED;
+        currentTicket.completed_at = null;
+      } else if (canRetry) {
+        currentTicket.triage_status = TRIAGE_STATUS.RETRY_WAIT;
+        currentTicket.status_reason = reason;
+        currentTicket.completed_at = null;
+      } else {
+        currentTicket.triage_status = TRIAGE_STATUS.MANUAL_REVIEW;
+        currentTicket.status_reason = reason;
+        currentTicket.completed_at = new Date();
+      }
       currentTicket.triage_failure_code = failureCode;
       currentTicket.processing_started_at = null;
-      currentTicket.completed_at = canRetry ? null : new Date();
       if (canRetry) currentTicket.retry_count += 1;
 
       logger.info(
@@ -272,12 +318,14 @@ export const processTicket = async ({ ticketId }: { ticketId: number }): Promise
           ticket_id: ticketId,
           previous_status: TRIAGE_STATUS.PROCESSING,
           new_status: currentTicket.triage_status,
-          reason,
+          reason: currentTicket.status_reason,
           retry_count: currentTicket.retry_count,
         },
         { transaction }
       );
-      logger.info(`Ticket ${ticketId} failure history recorded with reason: ${reason}`);
+      logger.info(
+        `Ticket ${ticketId} failure history recorded with reason: ${currentTicket.status_reason}`
+      );
       failurePersisted = true;
     });
 
@@ -329,11 +377,16 @@ export const findSemanticTriage = async ({
   });
   if (!closest) return null;
   const similarity = 1 - Number(closest.get('cosineDistance'));
-  if (!Number.isFinite(similarity) || similarity < SEMANTIC_REUSE_THRESHOLD) return null;
+  const similarityIsInvalid = !Number.isFinite(similarity);
+  if (similarityIsInvalid) return null;
+  const similarityIsBelowThreshold = similarity < SEMANTIC_REUSE_THRESHOLD;
+  if (similarityIsBelowThreshold) return null;
   const previous = await TriageResult.findOne({
     where: { ticket_id: closest.ticket_id, model_name: MODEL_NAME, prompt_version: PROMPT_VERSION },
   });
-  if (!previous || (previous.confidence ?? 0) < 0.85) return null;
+  if (!previous) return null;
+  const previousConfidenceIsLow = (previous.confidence ?? 0) < 0.85;
+  if (previousConfidenceIsLow) return null;
   return verifySemanticReuse({
     ticket: { subject: ticket.subject, body: ticket.body },
     category: previous.category as import('../../modules/tickets/enum').TICKET_CATEGORY,
@@ -359,8 +412,10 @@ const detectDuplicate = async ({
       where: { ticket_id: ticketId },
       defaults: { ticket_id: ticketId, embedding_model: EMBEDDING_MODEL, embedding: vector },
     });
+    let embeddingPersistenceOutcome = 'already existed';
+    if (embeddingCreated) embeddingPersistenceOutcome = 'created';
     logger.info(
-      `Ticket ${ticketId} embedding persistence completed: ${embeddingCreated ? 'created' : 'already existed'}`
+      `Ticket ${ticketId} embedding persistence completed: ${embeddingPersistenceOutcome}`
     );
 
     logger.info(`Ticket ${ticketId} duplicate candidate lookup started`);

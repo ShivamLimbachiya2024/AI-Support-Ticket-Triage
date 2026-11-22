@@ -13,6 +13,15 @@ interface GeminiApiError {
   cause?: unknown;
 }
 
+const retryableHttpStatuses = [408, 500, 502, 503, 504];
+const authenticationStatuses = [401, 403];
+const retryableTransportErrorNames: unknown[] = [
+  'TimeoutError',
+  'RequestTimeoutError',
+  'APIConnectionTimeoutError',
+  'ConnectionError',
+  'APIConnectionError',
+];
 const transportErrorCodes = new Set([
   'ECONNABORTED',
   'ECONNREFUSED',
@@ -36,22 +45,19 @@ export const classifyProviderError = ({ error }: { error: unknown }): FailureDec
     // generateContent reports an explicit HTTP response as ApiError.status.
     if (typeof status === 'number') {
       if (status === 429) return { kind: GEMINI_FAILURE_KIND.RATE_LIMIT };
-      if ([408, 500, 502, 503, 504].includes(status))
-        return { kind: GEMINI_FAILURE_KIND.TRANSIENT };
+      if (retryableHttpStatuses.includes(status)) return { kind: GEMINI_FAILURE_KIND.TRANSIENT };
       if (status === 402) return { kind: GEMINI_FAILURE_KIND.PAYMENT_REQUIRED };
-      if (status === 401 || status === 403) return { kind: GEMINI_FAILURE_KIND.CONFIGURATION };
+      if (authenticationStatuses.includes(status))
+        return { kind: GEMINI_FAILURE_KIND.CONFIGURATION };
       if ([400, 404, 422].includes(status)) return { kind: GEMINI_FAILURE_KIND.INVALID_REQUEST };
       return { kind: GEMINI_FAILURE_KIND.UNCLASSIFIED };
     }
 
-    // The SDK signals its own request timeout with AbortError. Triage supplies no caller signal.
-    if (
-      (typeof code === 'string' && transportErrorCodes.has(code)) ||
-      name === 'TimeoutError' ||
-      name === 'AbortError'
-    ) {
-      hasTransportFailure = true;
-    }
+    // The SDK may keep these names after wrapping a low-level timeout or connection failure.
+    const codeIsTransportFailure = typeof code === 'string' && transportErrorCodes.has(code);
+    if (codeIsTransportFailure) hasTransportFailure = true;
+    const nameIsRetryableTransportFailure = retryableTransportErrorNames.includes(name);
+    if (nameIsRetryableTransportFailure) hasTransportFailure = true;
     current = cause;
   }
 

@@ -53,7 +53,8 @@ export const sendToQueue = async (message: QueueMessage): Promise<void> => {
       }
     });
   } catch (error) {
-    const reason = error instanceof Error ? error.message : 'an unknown error';
+    let reason = 'an unknown error';
+    if (error instanceof Error) reason = error.message;
     logger.warn(
       `Publishing ${message.action} for ticket ${payload.ticketId} to ${message.queueName} failed: ${reason}`
     );

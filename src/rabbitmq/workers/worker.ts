@@ -100,9 +100,9 @@ export const startQueueWorker = async ({
           logger.info(`Message for ticket ${payload.ticketId} acknowledged`);
         }
       } catch (error) {
-        logger.error(
-          `Message processing from ${queueName} failed with ${error instanceof Error ? error.name : 'an unknown error'}`
-        );
+        let errorName = 'an unknown error';
+        if (error instanceof Error) errorName = error.name;
+        logger.error(`Message processing from ${queueName} failed with ${errorName}`);
         logger.info(`Returning failed ${queueName} message to RabbitMQ for delayed redelivery`);
         try {
           channel.reject(message, true);
@@ -114,7 +114,8 @@ export const startQueueWorker = async ({
         }
       } finally {
         activeMessages -= 1;
-        if (stopping && activeMessages === 0) {
+        const workerIsIdleDuringShutdown = stopping && activeMessages === 0;
+        if (workerIsIdleDuringShutdown) {
           const resolve = resolveIdle;
           resolveIdle = undefined;
           resolve?.();

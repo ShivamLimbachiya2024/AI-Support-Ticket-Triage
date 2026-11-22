@@ -20,9 +20,10 @@ interface RetryClassificationInput {
 }
 
 export const canRetryClassification = (
-  ticket: Pick<Ticket, 'triage_status' | 'triage_failure_code'>
+  ticket: Pick<Ticket, 'triage_status' | 'status_reason' | 'triage_failure_code'>
 ): boolean =>
   ticket.triage_status === TRIAGE_STATUS.MANUAL_REVIEW &&
+  ticket.status_reason === TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED &&
   ticket.triage_failure_code === TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION;
 
 const persistClassificationRetry = async ({
@@ -93,7 +94,7 @@ export const retryTicketClassification = async ({
   logger.info(`Request ${requestId} classification retry requested for ticket ${ticketId}`);
   logger.info(`Request ${requestId} retry eligibility lookup started for ticket ${ticketId}`);
   const ticket = await Ticket.findByPk(ticketId, {
-    attributes: ['triage_status', 'triage_failure_code'],
+    attributes: ['triage_status', 'status_reason', 'triage_failure_code'],
   });
   if (!ticket) {
     logger.info(`Request ${requestId} retry ticket ${ticketId} was not found`);
@@ -126,8 +127,10 @@ export const retryTicketClassification = async ({
       `Request ${requestId} retry status transaction committed for ticket ${ticketId} with outcome ${outcome}`
     );
   } catch (error) {
+    let errorName = 'an unknown error';
+    if (error instanceof Error) errorName = error.name;
     logger.error(
-      `Request ${requestId} classification retry transaction failed for ticket ${ticketId} with ${error instanceof Error ? error.name : 'an unknown error'}`
+      `Request ${requestId} classification retry transaction failed for ticket ${ticketId} with ${errorName}`
     );
     throw error;
   }

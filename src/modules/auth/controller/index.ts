@@ -15,9 +15,9 @@ export const registerUser = async (req: AuthRequest, res: Response) => {
 
   logger.info(`Request ${requestId} checking whether the account email is already registered`);
   const existingUser = await User.findOne({ where: { email } });
-  logger.info(
-    `Request ${requestId} account email lookup completed: ${existingUser ? 'already registered' : 'available'}`
-  );
+  let emailLookupOutcome = 'available';
+  if (existingUser) emailLookupOutcome = 'already registered';
+  logger.info(`Request ${requestId} account email lookup completed: ${emailLookupOutcome}`);
 
   if (existingUser) {
     logger.warn(

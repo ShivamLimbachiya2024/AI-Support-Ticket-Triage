@@ -17,7 +17,8 @@ export const validate =
   (schema: Joi.ObjectSchema, source: 'body' | 'params' = 'body') =>
   (req: Request, res: Response, next: NextFunction) => {
     const requestId = (req as AuthRequest).requestId ?? 'unknown';
-    const input = source === 'body' ? req.body : req.params;
+    let input = req.body;
+    if (source === 'params') input = req.params;
     logger.info(`Request ${requestId} ${source} validation started`);
     const { error, value } = schema.validate(input, { abortEarly: false, stripUnknown: true });
     if (error) {
@@ -70,7 +71,8 @@ export const validateQuery =
 export const authenticate = async (req: AuthRequest, res: Response, next: NextFunction) => {
   const requestId = req.requestId ?? 'unknown';
   logger.info(`Request ${requestId} authentication started`);
-  const token = req.cookies?.token || req.headers.authorization?.replace('Bearer ', '');
+  let token = req.cookies?.token;
+  if (!token) token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) {
     logger.warn(`Request ${requestId} authentication rejected because no token was provided`);
     generalResponse({

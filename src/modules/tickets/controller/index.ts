@@ -16,13 +16,17 @@ import { canRetryClassification, retryTicketClassification } from '../helper';
 export const submitTicket = async (req: AuthRequest, res: Response) => {
   const requestId = req.requestId ?? 'unknown';
   const { subject, body, customer_email: submittedEmail } = req.body;
-  const customerEmail = req.role === USER_ROLE.SUPPORT ? submittedEmail : req.userEmail;
+  let customerEmail = req.userEmail;
+  if (req.role === USER_ROLE.SUPPORT) customerEmail = submittedEmail;
   logger.info(`Request ${requestId} ticket submission started for user ${req.userId}`);
 
-  if (
-    req.role !== USER_ROLE.SUPPORT &&
-    submittedEmail.toLowerCase() !== customerEmail?.toLowerCase()
-  ) {
+  let customerEmailDoesNotMatchAccount = false;
+  if (req.role !== USER_ROLE.SUPPORT) {
+    const submittedEmailMatchesAccount =
+      submittedEmail.toLowerCase() === customerEmail?.toLowerCase();
+    customerEmailDoesNotMatchAccount = !submittedEmailMatchesAccount;
+  }
+  if (customerEmailDoesNotMatchAccount) {
     logger.warn(
       `Request ${requestId} ticket submission rejected because the email did not match user ${req.userId}`
     );
@@ -94,9 +98,23 @@ export const getTicket = async (req: AuthRequest, res: Response) => {
   const ticket = await Ticket.findByPk(req.params.id, {});
   logger.info(`Request ${requestId} ticket lookup completed for ticket ${req.params.id}`);
 
-  if (!ticket || (req.role !== USER_ROLE.SUPPORT && Number(ticket.customer_id) !== req.userId)) {
+  if (!ticket) {
+    logger.warn(`Request ${requestId} ticket ${req.params.id} was not found`);
+    generalResponse({
+      response: res,
+      message: 'Ticket not found',
+      responseType: 'error',
+      statusCode: 404,
+    });
+    return;
+  }
+
+  const userIsSupport = req.role === USER_ROLE.SUPPORT;
+  const ticketIsOwnedByUser = Number(ticket.customer_id) === req.userId;
+  const userCannotAccessTicket = !userIsSupport && !ticketIsOwnedByUser;
+  if (userCannotAccessTicket) {
     logger.warn(
-      `Request ${requestId} ticket ${req.params.id} was not found or was not accessible to user ${req.userId}`
+      `Request ${requestId} ticket ${req.params.id} was not accessible to user ${req.userId}`
     );
     generalResponse({
       response: res,
@@ -107,7 +125,7 @@ export const getTicket = async (req: AuthRequest, res: Response) => {
     return;
   }
 
-  if (req.role !== USER_ROLE.SUPPORT) {
+  if (!userIsSupport) {
     logger.info(
       `Request ${requestId} returning status-only details for customer-owned ticket ${ticket.id}`
     );
@@ -137,8 +155,10 @@ export const getTicket = async (req: AuthRequest, res: Response) => {
       'updatedAt',
     ],
   });
+  let resultLookupOutcome = 'result not available';
+  if (result) resultLookupOutcome = 'result found';
   logger.info(
-    `Request ${requestId} triage result lookup completed for ticket ${ticket.id}: ${result ? 'result found' : 'result not available'}`
+    `Request ${requestId} triage result lookup completed for ticket ${ticket.id}: ${resultLookupOutcome}`
   );
   generalResponse({
     response: res,
@@ -173,9 +193,12 @@ export const listTickets = async (req: AuthRequest, res: Response) => {
   const resultWhere: Record<string, string> = {};
   if (category) resultWhere.category = category;
   if (priority) resultWhere.priority = priority;
+  const ticketWhere: Record<string, string> = {};
+  if (status) ticketWhere.triage_status = status;
+  const hasResultFilter = [category, priority].some((filter) => Boolean(filter));
   logger.info(`Request ${requestId} ticket list database query started`);
   const { rows, count } = await Ticket.findAndCountAll({
-    where: status ? { triage_status: status } : {},
+    where: ticketWhere,
     attributes: [
       'id',
       'customer_id',
@@ -198,7 +221,7 @@ export const listTickets = async (req: AuthRequest, res: Response) => {
       {
         model: TriageResult,
         as: 'triage_result',
-        required: Boolean(category || priority),
+        required: hasResultFilter,
         where: resultWhere,
         attributes: [
           'id',

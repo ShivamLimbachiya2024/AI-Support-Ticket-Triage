@@ -22,7 +22,7 @@ import TicketStatusHistory from '../../../sequelize/models/ticket_status_history
 import TicketProcessingOutbox from '../../../sequelize/models/ticket_processing_outbox.modal';
 import { probeGeminiConnection } from '../../../rabbitmq/triage';
 import { canRetryClassification, retryTicketClassification } from '../helper';
-import { TICKET_TRIAGE_FAILURE_CODE, TRIAGE_STATUS } from '../enum';
+import { TICKET_STATUS_REASON, TICKET_TRIAGE_FAILURE_CODE, TRIAGE_STATUS } from '../enum';
 
 const retryInput = { requestId: 'request-1', ticketId: 42, actorUserId: 7 };
 
@@ -34,18 +34,28 @@ test('allows retry only for a Gemini connection failure in manual review', () =>
   expect(
     canRetryClassification({
       triage_status: TRIAGE_STATUS.MANUAL_REVIEW,
+      status_reason: TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED,
       triage_failure_code: TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION,
     })
   ).toBe(true);
   expect(
     canRetryClassification({
       triage_status: TRIAGE_STATUS.MANUAL_REVIEW,
+      status_reason: TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED,
       triage_failure_code: TICKET_TRIAGE_FAILURE_CODE.INVALID_CLASSIFICATION,
     })
   ).toBe(false);
   expect(
     canRetryClassification({
       triage_status: TRIAGE_STATUS.PENDING,
+      status_reason: TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED,
+      triage_failure_code: TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION,
+    })
+  ).toBe(false);
+  expect(
+    canRetryClassification({
+      triage_status: TRIAGE_STATUS.MANUAL_REVIEW,
+      status_reason: TICKET_STATUS_REASON.GEMINI_CONNECTION_RETRY_SCHEDULED,
       triage_failure_code: TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION,
     })
   ).toBe(false);
@@ -62,6 +72,7 @@ test('stops before Gemini and the transaction when the ticket does not exist', a
 test('stops before the transaction when the Gemini availability probe fails', async () => {
   (Ticket.findByPk as jest.Mock).mockResolvedValue({
     triage_status: TRIAGE_STATUS.MANUAL_REVIEW,
+    status_reason: TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED,
     triage_failure_code: TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION,
   });
   (probeGeminiConnection as jest.Mock).mockResolvedValue(false);
@@ -77,7 +88,7 @@ test('updates history and records an outbox event after Gemini is available', as
   const currentTicket = {
     triage_status: TRIAGE_STATUS.MANUAL_REVIEW,
     triage_failure_code: TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION,
-    status_reason: 'Gemini connection failed',
+    status_reason: TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED,
     processing_started_at: new Date(),
     completed_at: new Date(),
     retry_count: 2,
@@ -86,6 +97,7 @@ test('updates history and records an outbox event after Gemini is available', as
   (Ticket.findByPk as jest.Mock)
     .mockResolvedValueOnce({
       triage_status: TRIAGE_STATUS.MANUAL_REVIEW,
+      status_reason: TICKET_STATUS_REASON.GEMINI_CONNECTION_FAILED,
       triage_failure_code: TICKET_TRIAGE_FAILURE_CODE.GEMINI_CONNECTION,
     })
     .mockResolvedValueOnce(currentTicket);

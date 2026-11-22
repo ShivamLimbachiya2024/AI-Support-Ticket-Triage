@@ -1,4 +1,5 @@
 import _ from 'lodash';
+import { GoogleGenAI } from '@google/genai';
 import { classifyProviderError } from '../../utils/retry';
 
 test('classifies rate limit, permanent, and transient failures', () => {
@@ -27,7 +28,7 @@ test('classifies rate limit, permanent, and transient failures', () => {
   expect(classifyProviderError({ error: retryAfterError })).toEqual({ kind: 'rateLimit' });
 });
 
-test('recognizes wrapped Node transport failures without trusting generic messages', () => {
+test('recognizes wrapped Node and Gemini SDK transport failures without trusting messages', () => {
   const transportError = { code: 'ECONNRESET' };
   const fetchError = _.assign(new TypeError('fetch failed'), { cause: transportError });
   const wrapped = _.assign(new Error('Gemini request failed'), { cause: fetchError });
@@ -35,9 +36,15 @@ test('recognizes wrapped Node transport failures without trusting generic messag
   expect(classifyProviderError({ error: wrapped }).kind).toBe('connection');
   expect(classifyProviderError({ error: transportError }).kind).toBe('connection');
   expect(classifyProviderError({ error: new TypeError('fetch failed') }).kind).toBe('unclassified');
-  expect(
-    classifyProviderError({ error: new DOMException('SDK deadline', 'AbortError') }).kind
-  ).toBe('connection');
+  expect(classifyProviderError({ error: { name: 'APIConnectionError' } }).kind).toBe('connection');
+  expect(classifyProviderError({ error: { name: 'APIConnectionTimeoutError' } }).kind).toBe(
+    'connection'
+  );
+  expect(classifyProviderError({ error: { name: 'RequestTimeoutError' } }).kind).toBe('connection');
+  expect(classifyProviderError({ error: { name: 'APIUserAbortError' } }).kind).toBe('unclassified');
+  expect(classifyProviderError({ error: new DOMException('Cancelled', 'AbortError') }).kind).toBe(
+    'unclassified'
+  );
   expect(classifyProviderError({ error: { cause: { name: 'TimeoutError' } } }).kind).toBe(
     'connection'
   );
@@ -56,4 +63,30 @@ test('gives HTTP status precedence and handles cyclic causes', () => {
   cyclic.cause = { cause: cyclic };
   expect(classifyProviderError({ error: cyclic }).kind).toBe('unclassified');
   expect(classifyProviderError({ error: null }).kind).toBe('unclassified');
+});
+
+test('classifies a timeout surfaced by the installed Gemini SDK as retryable', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = jest.fn(async () => {
+    const timeoutError = new Error('Gemini request timed out');
+    timeoutError.name = 'TimeoutError';
+    throw timeoutError;
+  });
+  const ai = new GoogleGenAI({
+    apiKey: 'unit-test-key',
+    httpOptions: { timeout: 50, retryOptions: { attempts: 1 } },
+  });
+  let caughtError: unknown;
+
+  try {
+    await ai.models.generateContent({ model: 'test-model', contents: 'test' });
+  } catch (error) {
+    caughtError = error;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  expect(caughtError).toBeInstanceOf(Error);
+  expect((caughtError as Error).name).toBe('TimeoutError');
+  expect(classifyProviderError({ error: caughtError }).kind).toBe('connection');
 });

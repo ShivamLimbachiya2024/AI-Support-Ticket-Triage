@@ -89,7 +89,8 @@ export const probeGeminiConnection = async (): Promise<boolean> => {
     logger.info('Gemini classification availability check succeeded');
     return true;
   } catch (error) {
-    const kind = error instanceof GeminiRequestError ? error.kind : 'unknown';
+    let kind = 'unknown';
+    if (error instanceof GeminiRequestError) kind = error.kind;
     logger.warn(`Gemini classification availability check failed with kind ${kind}`);
     return false;
   }
@@ -125,8 +126,8 @@ export const validateCandidate = ({
   }
 
   logger.info('Checking that candidate evidence quotes the source ticket');
-  const hasSourceEvidence = candidate.evidence.every(
-    (quote: string) => ticket.subject.includes(quote) || ticket.body.includes(quote)
+  const hasSourceEvidence = candidate.evidence.every((quote: string) =>
+    [ticket.subject, ticket.body].some((ticketText) => ticketText.includes(quote))
   );
   if (!hasSourceEvidence) {
     logger.warn('Candidate triage rejected because evidence did not match the source ticket');
@@ -139,16 +140,13 @@ export const validateCandidate = ({
   const candidateSummary = candidate.summary as string;
   let sentenceEndings = 0;
   for (const character of candidateSummary) {
-    if (character === '.' || character === '?' || character === '!') sentenceEndings += 1;
+    if (['.', '?', '!'].includes(character)) sentenceEndings += 1;
   }
-  if (
-    sentenceEndings !== 1 ||
-    !(
-      candidateSummary.endsWith('.') ||
-      candidateSummary.endsWith('?') ||
-      candidateSummary.endsWith('!')
-    )
-  ) {
+  const hasExactlyOneSentence = sentenceEndings === 1;
+  const sentenceEndsWithPunctuation = ['.', '?', '!'].some((ending) =>
+    candidateSummary.endsWith(ending)
+  );
+  if (!hasExactlyOneSentence || !sentenceEndsWithPunctuation) {
     logger.warn('Candidate triage rejected because the summary was not exactly one sentence');
     throw new InvalidClassificationError('Invalid model output: summary must be one sentence');
   }
@@ -211,8 +209,9 @@ export const runVerifiedTriage = async ({
   logger.warn(
     `Verified triage stopped after ${MAX_OUTPUT_ATTEMPTS} unsuccessful candidate attempts`
   );
+  const lastErrorMessage = lastError?.message ?? '';
   throw new InvalidClassificationError(
-    `Invalid model output: validation failed after ${MAX_OUTPUT_ATTEMPTS} attempts. ${lastError?.message || ''}`
+    `Invalid model output: validation failed after ${MAX_OUTPUT_ATTEMPTS} attempts. ${lastErrorMessage}`
   );
 };
 export const runGeminiTriage = async ({
@@ -460,7 +459,9 @@ export const verifySemanticReuse = async ({
       temperature: 0.1,
     },
   });
-  const parsedResponse = JSON.parse(response.text || 'null') as unknown;
+  let responseText = response.text;
+  if (!responseText) responseText = 'null';
+  const parsedResponse = JSON.parse(responseText) as unknown;
   const { error, value: parsed } = semanticReuseResultSchema.validate(parsedResponse);
   if (error)
     throw new InvalidClassificationError(
@@ -477,7 +478,7 @@ export const verifySemanticReuse = async ({
       evidence: parsed.evidence,
     },
   });
-  return candidate.confidence >= 0.85
-    ? validateResult(_.pick(candidate, ['category', 'priority', 'summary', 'confidence']))
-    : null;
+  const candidateIsConfident = candidate.confidence >= 0.85;
+  if (!candidateIsConfident) return null;
+  return validateResult(_.pick(candidate, ['category', 'priority', 'summary', 'confidence']));
 };

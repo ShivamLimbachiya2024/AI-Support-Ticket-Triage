@@ -4,19 +4,17 @@ export const removeKeys = (
   obj: Record<string, any>,
   keysToRemove: string[] = ['created_at', 'updated_at']
 ): Record<string, any> => {
-  if (!_.isObject(obj) || _.isArray(obj)) {
-    return obj; // Return value directly if not an object or is an array
-  }
+  if (!_.isObject(obj)) return obj;
+  if (_.isArray(obj)) return obj;
 
   return _.reduce(
     obj,
     (result, value, key) => {
-      if (!keysToRemove.includes(key)) {
-        result[key] =
-          _.isObject(value) && !_.isArray(value)
-            ? removeKeys(value, keysToRemove) // Recursively call for nested objects
-            : value;
-      }
+      if (keysToRemove.includes(key)) return result;
+
+      const valueIsNestedObject = _.isObject(value) && !_.isArray(value);
+      if (valueIsNestedObject) result[key] = removeKeys(value, keysToRemove);
+      else result[key] = value;
       return result;
     },
     {} as Record<string, any>

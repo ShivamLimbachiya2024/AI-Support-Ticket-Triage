@@ -89,9 +89,9 @@ const shutdown = ({ reason, exitCode }: { reason: string; exitCode: number }): P
     await db.close();
     logger.info('Application shutdown completed');
   })().catch((error: unknown) => {
-    logger.error(
-      `Application shutdown failed with ${error instanceof Error ? error.name : 'an unknown error'}`
-    );
+    let errorName = 'an unknown error';
+    if (error instanceof Error) errorName = error.name;
+    logger.error(`Application shutdown failed with ${errorName}`);
     process.exitCode = 1;
   });
   return shutdownPromise;
@@ -101,9 +101,9 @@ process.once('SIGINT', () => void shutdown({ reason: 'SIGINT received', exitCode
 process.once('SIGTERM', () => void shutdown({ reason: 'SIGTERM received', exitCode: 0 }));
 
 start().catch((error: unknown) => {
-  logger.error(
-    `Startup failed with ${error instanceof Error ? error.message : 'an unknown error'}`
-  );
+  let errorMessage = 'an unknown error';
+  if (error instanceof Error) errorMessage = error.message;
+  logger.error(`Startup failed with ${errorMessage}`);
   void shutdown({ reason: 'startup failure', exitCode: 1 });
 });
 export default app;
