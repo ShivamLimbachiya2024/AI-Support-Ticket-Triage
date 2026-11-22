@@ -16,7 +16,7 @@ services:
       retries: 12
   rabbitmq:
     image: rabbitmq:4.3.7-management
-    pull_policy: never
+    pull_policy: missing
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?required}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?required}

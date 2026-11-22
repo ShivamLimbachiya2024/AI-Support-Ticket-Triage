@@ -4,15 +4,17 @@ Express, PostgreSQL/pgvector, RabbitMQ, and Gemini support ticket triage. The AP
 
 ## Run
 
-1. Copy .env.example to .env and set all required values. Set `DATABASE_URL` to a PostgreSQL connection string using host `postgres` for Compose, and set a long `JWT_SECRET` and a changed support password.
-2. Run `docker compose up -d --build`.
+You need Docker Engine with the Docker Compose plugin and internet access for the first run. You do not need Node.js, PostgreSQL, or RabbitMQ installed on the host. Compose downloads missing registry images and builds the application and pgvector-enabled PostgreSQL images.
+
+1. Copy `.env.example` to `.env` and set the required values. Set `DATABASE_URL` to a PostgreSQL connection string using host `postgres` for Compose, and set a long `JWT_SECRET` and a changed support password.
+2. Run `docker compose up -d --build`. Compose builds the application and PostgreSQL images, and downloads RabbitMQ if its image is missing locally.
 3. The API runs on PORT. Compose starts one worker consuming the quorum `ticket_processing` queue. RabbitMQ applies native delayed retry when the worker returns a retryable message. The support account is seeded from SUPPORT_EMAIL and SUPPORT_PASSWORD.
 
 RabbitMQ queue types are immutable. If an earlier run created `ticket_processing` as a classic queue, finish or recover its pending messages, then delete the empty queue before starting this version so it can be recreated as quorum.
 
 For a no-key run, set `MODEL_PROVIDER=fake`, `MODEL_NAME=fake_v1`, and `EMBEDDING_MODEL=fake_embedding_v1`. For a lower-cost real Gemini run, set `MODEL_PROVIDER=gemini`, `MODEL_NAME=gemini-3.5-flash-lite`, `EMBEDDING_MODEL=gemini-embedding-2`, and `GEMINI_API_KEY`. `GEMINI_API_KEY` is required only in Gemini mode. Confirm the model has a nonzero quota for your project in Google AI Studio. When running the app outside Compose, set the host in `DATABASE_URL` to the address where PostgreSQL is reachable, such as `localhost`.
 
-Run npm test and npm run build. Migrations use Sequelize CLI and the pgvector extension is bootstrapped by the PostgreSQL image. The pgvector image builds FROM the existing postgres:16 image; Compose uses the existing rabbitmq:4.3.7-management image.
+Run npm test and npm run build. Migrations use Sequelize CLI and the pgvector extension is bootstrapped by the PostgreSQL image. The pgvector image builds from the `postgres:16` and `pgvector/pgvector:0.8.1-pg16` base images; Compose downloads `rabbitmq:4.3.7-management` when it is missing locally.
 
 ## API
 
