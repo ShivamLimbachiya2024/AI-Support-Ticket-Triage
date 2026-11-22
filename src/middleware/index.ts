@@ -149,13 +149,20 @@ export const errorHandler = (
   nextFunction: NextFunction
 ) => {
   const requestId = (req as AuthRequest).requestId ?? 'unknown';
-  logger.error(`Request ${requestId} ${req.method} ${req.path} failed: ${error.message}`);
+  const bodyParserError = error as Error & { status?: number; type?: string };
+  const isMalformedJson =
+    bodyParserError.status === 400 && bodyParserError.type === 'entity.parse.failed';
+  const statusCode = isMalformedJson ? 400 : 500;
+  const message = isMalformedJson ? 'Malformed JSON request body' : 'Internal server error';
+  logger.error(
+    `Request ${requestId} ${req.method} ${req.path} failed: ${isMalformedJson ? message : error.message}`
+  );
   if (!res.headersSent) {
     generalResponse({
       response: res,
-      message: 'Internal server error',
+      message,
       responseType: 'error',
-      statusCode: 500,
+      statusCode,
     });
   }
 };
