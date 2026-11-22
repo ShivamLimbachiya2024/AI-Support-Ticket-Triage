@@ -7,8 +7,18 @@ jest.mock('../../config', () => ({
 }));
 
 import _ from 'lodash';
-import { createGeminiHttpOptions, GEMINI_HTTP_OPTIONS, runGeminiTriage } from '../triage';
+import {
+  createGeminiHttpOptions,
+  GEMINI_HTTP_OPTIONS,
+  GEMINI_PROBE_HTTP_OPTIONS,
+  runGeminiTriage,
+} from '../triage';
 import { TICKET_CATEGORY, TICKET_PRIORITY } from '../../modules/tickets/enum';
+
+test('configures the Gemini availability probe with the minimum supported timeout', () => {
+  expect(GEMINI_PROBE_HTTP_OPTIONS.timeout).toBeGreaterThanOrEqual(10000);
+  expect(GEMINI_PROBE_HTTP_OPTIONS.retryOptions).toEqual({ attempts: 1 });
+});
 
 test('retries rejected Gemini output, isolates ticket data, and configures SDK transport retries', async () => {
   const mockGenerateContent = jest.fn();

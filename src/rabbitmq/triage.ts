@@ -48,6 +48,11 @@ export const GEMINI_HTTP_OPTIONS = {
     jitter: 0.5,
   },
 };
+export const GEMINI_PROBE_HTTP_OPTIONS = {
+  baseUrl: geminiBaseUrl,
+  timeout: 10000,
+  retryOptions: { attempts: 1 },
+};
 export const createGeminiHttpOptions = ({
   signal,
 }: {
@@ -91,7 +96,7 @@ export const probeGeminiConnection = async (): Promise<boolean> => {
     const { GoogleGenAI } = await import('@google/genai');
     const ai = new GoogleGenAI({
       ...geminiClientOptions,
-      httpOptions: { baseUrl: geminiBaseUrl, timeout: 5000, retryOptions: { attempts: 1 } },
+      httpOptions: GEMINI_PROBE_HTTP_OPTIONS,
     });
 
     const response = await generateGeminiContent({
